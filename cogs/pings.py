@@ -113,10 +113,14 @@ class PingsAlbion(commands.Cog):
         if rol_miembro:
             mencion_final += f"{rol_miembro.mention}"
 
-        msg_lista = await ctx.send(
+        # Se envía al canal directamente para que create_thread funcione tanto con ! como con /
+        msg_lista = await ctx.channel.send(
             content=mencion_final if mencion_final else None,
             embed=generar_embed()
         )
+        # Confirmar la interacción slash si aplica
+        if ctx.interaction:
+            await ctx.send("✅", ephemeral=True, delete_after=1)
 
         hilo = await msg_lista.create_thread(name=f"Inscripción - {tipo}", auto_archive_duration=60)
         await hilo.send("📢 **Escribe el número del puesto para anotarte | Usa -número para salir**")
@@ -133,8 +137,34 @@ class PingsAlbion(commands.Cog):
                 contenido = msg.content.strip()
                 usuario = msg.author
 
+                roles_oficial = ["Oficial", "Guild Master"]
+                es_oficial = any(r.name in roles_oficial for r in usuario.roles)
+
+                # Oficial inscribe a otro: número @mención
+                if es_oficial and msg.mentions and contenido.split()[0].isdigit():
+                    try:
+                        await msg.delete()
+                    except: pass
+                    num = int(contenido.split()[0])
+                    objetivo = msg.mentions[0]
+                    if num in participantes:
+                        if participantes[num] is not None and participantes[num] != objetivo:
+                            nombre_rol = puestos_nombres[num - 1]
+                            await hilo.send(
+                                f"❌ El puesto **{nombre_rol}** ya está ocupado por {participantes[num].mention}.",
+                                delete_after=5
+                            )
+                        else:
+                            for p in participantes:
+                                if participantes[p] == objetivo:
+                                    participantes[p] = None
+                            participantes[num] = objetivo
+                            await msg_lista.edit(embed=generar_embed())
+                    else:
+                        await hilo.send(f"❌ El puesto {num} no existe en esta lista.", delete_after=3)
+
                 # Salirse de un puesto: -número
-                if contenido.startswith("-") and contenido[1:].isdigit():
+                elif contenido.startswith("-") and contenido[1:].isdigit():
                     try:
                         await msg.delete()
                     except: pass
@@ -164,7 +194,6 @@ class PingsAlbion(commands.Cog):
                                         delete_after=5
                                     )
                         else:
-                            # Liberar puesto anterior del usuario si tenía uno
                             for p in participantes:
                                 if participantes[p] == usuario:
                                     participantes[p] = None
