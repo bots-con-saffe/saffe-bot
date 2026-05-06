@@ -1,0 +1,18 @@
+{
+    "grupales": [
+        "Tanque",
+        "Healer",
+        "Sc",
+        "Flamigero",
+        "Badon",
+        "invocador de luz",
+        "prefora nieblas"
+    ],
+    "rastreo": [
+        "Tanque",
+        "Healer",
+        "Dps",
+        "Dps",
+        "Dps"
+    ]
+}
