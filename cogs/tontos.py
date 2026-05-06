@@ -1,1 +1,0 @@
-tizo tonto 1
