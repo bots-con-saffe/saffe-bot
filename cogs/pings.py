@@ -1,60 +1,96 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import asyncio
-import json
-import os
+from db import get_db
+
 
 class PingsAlbion(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.archivo_data = "actividades.json"
-        if not os.path.exists(self.archivo_data):
-            with open(self.archivo_data, "w") as f:
-                json.dump({}, f)
+        # Mapeo thread_id -> registro_actividad_id para que callout pueda guardar asistencias
+        self.active_registros: dict[int, int] = {}
 
-    def cargar_datos(self):
-        with open(self.archivo_data, "r") as f:
-            return json.load(f)
+    # --- PLANTILLAS ---
 
-    def guardar_datos(self, data):
-        with open(self.archivo_data, "w") as f:
-            json.dump(data, f, indent=4)
-
-    @commands.command(name="crear_plantilla")
+    @commands.hybrid_command(name="crear_plantilla", description="Crea o actualiza una plantilla de actividad")
+    @app_commands.describe(
+        nombre="Nombre de la actividad (ej: dungeon)",
+        puestos="Puestos separados por comas (ej: Tanque, Healer, Dps, Dps)"
+    )
     @commands.has_permissions(administrator=True)
-    async def crear_plantilla(self, ctx, nombre: str, *, puestos_str: str):
-        try: await ctx.message.delete()
+    async def crear_plantilla(self, ctx, nombre: str, *, puestos: str):
+        await ctx.defer(ephemeral=True)
+        try:
+            await ctx.message.delete()
         except: pass
-        data = self.cargar_datos()
-        lista_puestos = [p.strip() for p in puestos_str.split(",")]
-        data[nombre.lower()] = lista_puestos
-        self.guardar_datos(data)
-        await ctx.send(f"✅ Plantilla **{nombre}** creada.", delete_after=5)
 
-    @commands.command(name="ping")
+        lista_puestos = [p.strip() for p in puestos.split(",")]
+
+        await asyncio.to_thread(
+            lambda: get_db().table('actividades')
+                .upsert({'nombre': nombre.lower(), 'puestos': lista_puestos}, on_conflict='nombre')
+                .execute()
+        )
+        await ctx.send(f"✅ Plantilla **{nombre}** guardada con {len(lista_puestos)} puestos.", delete_after=5)
+
+    @commands.hybrid_command(name="plantillas", description="Lista todas las plantillas de actividades disponibles")
+    async def listar_plantillas(self, ctx):
+        await ctx.defer()
+        result = await asyncio.to_thread(
+            lambda: get_db().table('actividades').select('nombre, puestos').execute()
+        )
+        if not result.data:
+            return await ctx.send("❌ No hay plantillas creadas todavía.", delete_after=5)
+
+        embed = discord.Embed(title="📋 Plantillas de actividades", color=discord.Color.blurple())
+        for item in result.data:
+            puestos_str = ", ".join(item['puestos'])
+            embed.add_field(name=item['nombre'].capitalize(), value=puestos_str, inline=False)
+        await ctx.send(embed=embed)
+
+    # --- PING DE ACTIVIDAD ---
+
+    @commands.hybrid_command(name="ping", description="Lanza una actividad con lista de inscripción")
+    @app_commands.describe(
+        tipo="Tipo de actividad (debe existir como plantilla)",
+        rol_ping="Rol a mencionar además de @Miembro (opcional)",
+        info="Información adicional sobre la actividad"
+    )
     @commands.has_permissions(manage_messages=True)
-    async def ping_dinamico(self, ctx, tipo: str, rol_ping: discord.Role = None, id_mensaje_build: str = None, *, info: str = "Sin detalles adicionales"):
-        try: await ctx.message.delete()
+    async def ping_dinamico(self, ctx, tipo: str, rol_ping: discord.Role = None, *, info: str = "Sin detalles adicionales"):
+        await ctx.defer()
+        try:
+            await ctx.message.delete()
         except: pass
 
-        data = self.cargar_datos()
-        tipo_buscado = tipo.lower()
+        # Cargar plantilla desde Supabase
+        result = await asyncio.to_thread(
+            lambda: get_db().table('actividades')
+                .select('puestos')
+                .eq('nombre', tipo.lower())
+                .execute()
+        )
 
-        if tipo_buscado not in data:
-            await ctx.send(f"❌ La actividad `{tipo}` no existe.", delete_after=5)
+        if not result.data:
+            await ctx.send(f"❌ La actividad `{tipo}` no existe. Usa `/plantillas` para ver las disponibles.", delete_after=7)
             return
 
-        puestos_nombres = data[tipo_buscado]
-        participantes = {i+1: None for i in range(len(puestos_nombres))}
-        
-        url_imagen = None
-        if id_mensaje_build and id_mensaje_build.isdigit():
-            try:
-                canal_builds = discord.utils.get(ctx.guild.text_channels, name="builds") or ctx.channel
-                msg_build = await canal_builds.fetch_message(int(id_mensaje_build))
-                if msg_build.attachments:
-                    url_imagen = msg_build.attachments[0].url
-            except: pass
+        puestos_nombres = result.data[0]['puestos']
+        participantes = {i + 1: None for i in range(len(puestos_nombres))}
+
+        # Guardar registro de la actividad
+        reg_result = await asyncio.to_thread(
+            lambda: get_db().table('registros_actividad')
+                .insert({
+                    'guild_id': str(ctx.guild.id),
+                    'tipo': tipo.lower(),
+                    'info': info,
+                    'creado_por': str(ctx.author.id)
+                })
+                .execute()
+        )
+        registro_id = reg_result.data[0]['id']
 
         def generar_embed():
             desc = ""
@@ -62,22 +98,31 @@ class PingsAlbion(commands.Cog):
                 user = participantes[i]
                 mencion = user.mention if user else "---"
                 desc += f"**({i}) {nombre}**: {mencion}\n"
-            
-            embed = discord.Embed(title=f"⚔️ {tipo.upper()}", description=desc, color=discord.Color.green())
+            embed = discord.Embed(
+                title=f"⚔️ {tipo.upper()}",
+                description=desc,
+                color=discord.Color.green()
+            )
             embed.add_field(name="Información", value=info)
-            if url_imagen:
-                embed.set_image(url=url_imagen)
             return embed
 
         rol_miembro = discord.utils.get(ctx.guild.roles, name="Miembro")
         mencion_final = ""
-        if rol_ping: mencion_final += f"{rol_ping.mention} "
-        if rol_miembro: mencion_final += f"{rol_miembro.mention}"
-        
-        msg_lista = await ctx.send(content=mencion_final if mencion_final else None, embed=generar_embed())
-        
+        if rol_ping:
+            mencion_final += f"{rol_ping.mention} "
+        if rol_miembro:
+            mencion_final += f"{rol_miembro.mention}"
+
+        msg_lista = await ctx.send(
+            content=mencion_final if mencion_final else None,
+            embed=generar_embed()
+        )
+
         hilo = await msg_lista.create_thread(name=f"Inscripción - {tipo}", auto_archive_duration=60)
-        await hilo.send("📢 **Utiliza el número solo para registrarte en la actividad | Usa -número para salir**")
+        await hilo.send("📢 **Escribe el número del puesto para anotarte | Usa -número para salir**")
+
+        # Registrar el hilo para que callout pueda guardar asistencias
+        self.active_registros[hilo.id] = registro_id
 
         def check(m):
             return m.channel.id == hilo.id and not m.author.bot
@@ -88,77 +133,82 @@ class PingsAlbion(commands.Cog):
                 contenido = msg.content.strip()
                 usuario = msg.author
 
-                # --- Lógica para quitarse (-número) ---
+                # Salirse de un puesto: -número
                 if contenido.startswith("-") and contenido[1:].isdigit():
-                    try: await msg.delete()
-                    except: pass
                     try:
-                        num = int(contenido[1:])
-                        if participantes.get(num) == usuario:
-                            participantes[num] = None
-                            await msg_lista.edit(embed=generar_embed())
+                        await msg.delete()
                     except: pass
-                
-                # --- Lógica para anotarse (número) ---
+                    num = int(contenido[1:])
+                    if participantes.get(num) == usuario:
+                        participantes[num] = None
+                        await msg_lista.edit(embed=generar_embed())
+
+                # Anotarse en un puesto: número
                 elif contenido.isdigit():
-                    try: await msg.delete()
+                    try:
+                        await msg.delete()
                     except: pass
-                    
                     num = int(contenido)
                     if num in participantes:
-                        # VERIFICACIÓN: ¿El puesto ya está ocupado?
                         if participantes[num] is not None:
-                            # Evitamos enviarle DM si por algún motivo pone el número de su propio puesto
                             if participantes[num] != usuario:
                                 nombre_rol = puestos_nombres[num - 1]
                                 dueño_actual = participantes[num].display_name
                                 try:
-                                    # Intentamos enviar el MD
-                                    await usuario.send(f"❌ Intentaste tomar el puesto **{num} ({nombre_rol})**, pero ya está ocupado por **{dueño_actual}**.")
+                                    await usuario.send(
+                                        f"❌ El puesto **{num} ({nombre_rol})** ya está ocupado por **{dueño_actual}**."
+                                    )
                                 except discord.Forbidden:
-                                    # Si tiene los MD cerrados, le avisamos por el hilo y borramos el mensaje rápido
-                                    await hilo.send(f"❌ {usuario.mention}, el puesto **{nombre_rol}** ya está ocupado por {dueño_actual}.", delete_after=5)
+                                    await hilo.send(
+                                        f"❌ {usuario.mention}, el puesto **{nombre_rol}** ya está ocupado.",
+                                        delete_after=5
+                                    )
                         else:
-                            # El puesto está libre, lo anotamos
+                            # Liberar puesto anterior del usuario si tenía uno
                             for p in participantes:
-                                if participantes[p] == usuario: participantes[p] = None
+                                if participantes[p] == usuario:
+                                    participantes[p] = None
                             participantes[num] = usuario
                             await msg_lista.edit(embed=generar_embed())
                     else:
                         await hilo.send(f"❌ El puesto {num} no existe en esta lista.", delete_after=3)
 
             except asyncio.TimeoutError:
+                self.active_registros.pop(hilo.id, None)
                 break
 
-    # --- COMANDO MASS PING ---
-    @commands.command(name="mass")
+    # --- MASS PING ---
+
+    @commands.hybrid_command(name="mass", description="Pingea a todos los inscritos en el hilo de la actividad")
+    @app_commands.describe(mensaje="Mensaje a enviar junto con las menciones")
     @commands.has_permissions(manage_messages=True)
-    async def mass_ping(self, ctx, *, mensaje_extra: str = "¡Log in ya salimos!"):
-        """Pingea a todos los anotados en la lista de este hilo"""
-        try: await ctx.message.delete()
+    async def mass_ping(self, ctx, *, mensaje: str = "¡Log in ya salimos!"):
+        await ctx.defer()
+        try:
+            await ctx.message.delete()
         except: pass
 
-        if isinstance(ctx.channel, discord.Thread):
-            try:
-                parent_msg = await ctx.channel.parent.fetch_message(ctx.channel.id)
-                if parent_msg.embeds:
-                    embed = parent_msg.embeds[0]
-                    menciones = []
-                    for line in embed.description.split("\n"):
-                        if "<@" in line:
-                            start = line.find("<@")
-                            end = line.find(">", start) + 1
-                            menciones.append(line[start:end])
-                    
-                    if menciones:
-                        lista_menciones = " ".join(menciones)
-                        await ctx.send(f"📢 {lista_menciones}\n**{mensaje_extra}**")
-                    else:
-                        await ctx.send("❌ No hay nadie anotado en la lista todavía.", delete_after=5)
-            except Exception as e:
-                await ctx.send(f"❌ Error al buscar la lista: {e}", delete_after=5)
-        else:
-            await ctx.send("❌ Este comando solo funciona dentro del hilo de una actividad.", delete_after=5)
+        if not isinstance(ctx.channel, discord.Thread):
+            return await ctx.send("❌ Este comando solo funciona dentro del hilo de una actividad.", delete_after=5)
+
+        try:
+            parent_msg = await ctx.channel.parent.fetch_message(ctx.channel.id)
+            if parent_msg.embeds:
+                embed = parent_msg.embeds[0]
+                menciones = []
+                for line in embed.description.split("\n"):
+                    if "<@" in line:
+                        start = line.find("<@")
+                        end = line.find(">", start) + 1
+                        menciones.append(line[start:end])
+
+                if menciones:
+                    await ctx.send(f"📢 {' '.join(menciones)}\n**{mensaje}**")
+                else:
+                    await ctx.send("❌ No hay nadie anotado todavía.", delete_after=5)
+        except Exception as e:
+            await ctx.send(f"❌ Error al buscar la lista: {e}", delete_after=5)
+
 
 async def setup(bot):
     await bot.add_cog(PingsAlbion(bot))

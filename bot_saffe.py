@@ -2,27 +2,23 @@ import discord
 from discord.ext import commands
 import os
 import sys
-import asyncio 
-from dotenv import load_dotenv # Nueva librería para seguridad
+import asyncio
+from dotenv import load_dotenv
 
-# 1. Cargamos las variables de entorno desde el archivo .env
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# 2. Configuración de Intents
 intents = discord.Intents.default()
-intents.voice_states = True 
-intents.message_content = True 
+intents.voice_states = True
+intents.message_content = True
 intents.members = True
 
-# 3. Creación del Bot
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# 4. Función para cargar módulos (Cogs)
 async def cargar_modulos():
     if not os.path.exists('./cogs'):
         os.makedirs('./cogs')
-        
+
     for filename in os.listdir('./cogs'):
         if filename.endswith('.py'):
             nombre_modulo = f'cogs.{filename[:-3]}'
@@ -32,12 +28,12 @@ async def cargar_modulos():
             except Exception as e:
                 print(f"❌ Error al cargar el módulo {nombre_modulo}:\n{e}")
 
-# Asignamos la función de carga al ciclo de inicio del bot
 bot.setup_hook = cargar_modulos
 
-# 5. Comandos de administración
+# --- COMANDOS DE ADMINISTRACIÓN ---
+
 @bot.command()
-@commands.is_owner()
+@commands.has_permissions(administrator=True)
 async def reload(ctx, modulo: str = "todos"):
     try:
         await ctx.message.delete()
@@ -53,7 +49,6 @@ async def reload(ctx, modulo: str = "todos"):
                     cargados += 1
                 except Exception as e:
                     await ctx.send(f"❌ Error al recargar `{nombre_modulo}`:\n```py\n{e}\n```")
-        
         await ctx.send(f"🔄 ¡Éxito! Se han recargado **{cargados}** módulos.", delete_after=5)
     else:
         try:
@@ -62,12 +57,25 @@ async def reload(ctx, modulo: str = "todos"):
         except Exception as e:
             await ctx.send(f"❌ Error al recargar `{modulo}`:\n```py\n{e}\n```")
 
-@bot.event
-async def on_ready():
-    print(f'✅ Saffe_bot encendido como: {bot.user}')
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def sync(ctx, guild_id: int = None):
+    """Sincroniza los slash commands. Usa !sync para global o !sync [guild_id] para un servidor específico (instantáneo)."""
+    try:
+        await ctx.message.delete()
+    except: pass
+
+    if guild_id:
+        guild = discord.Object(id=guild_id)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        await ctx.send(f"✅ {len(synced)} comandos sincronizados en el servidor `{guild_id}`.", delete_after=10)
+    else:
+        synced = await bot.tree.sync()
+        await ctx.send(f"✅ {len(synced)} comandos sincronizados globalmente (puede tardar hasta 1 hora en aparecer).", delete_after=10)
 
 @bot.command()
-@commands.is_owner()
+@commands.has_permissions(administrator=True)
 async def restart(ctx):
     try:
         await ctx.message.delete()
@@ -75,15 +83,17 @@ async def restart(ctx):
 
     mensaje = await ctx.send("🔄 Reiniciando el sistema por completo...")
     await asyncio.sleep(2)
-    
     try:
         await mensaje.delete()
     except: pass
-        
-    # Reinicia el script de Python
+
     os.execv(sys.executable, ['python'] + sys.argv)
 
-# 6. Arranque seguro
+@bot.event
+async def on_ready():
+    print(f'✅ Saffe_bot encendido como: {bot.user}')
+    print(f'💡 Usa !sync [guild_id] para activar los slash commands en tu servidor.')
+
 if __name__ == "__main__":
     if TOKEN:
         bot.run(TOKEN)
