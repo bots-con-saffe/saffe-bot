@@ -6,71 +6,42 @@ from discord import app_commands
 class AsignacionRoles(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.PAQUETES = {
+            "miembro": ["Miembro", "PvE Content", "PvP Content"],
+            "miembroava": ["Miembro", "PvE Content", "PvP Content", "Ava Core"]
+        }
 
-    PAQUETES = {
-        "miembro": ["Miembro", "Pve content", "Pvp content"],
-        "miembroava": ["Miembro", "Pve content", "Pvp content", "Ava core"]
-    }
+    async def paquete_autocomplete(self, interaction: discord.Interaction, current: str):
+        opciones = list(self.PAQUETES.keys())
+        return [
+            app_commands.Choice(name=opc, value=opc)
+            for opc in opciones if current.lower() in opc.lower()
+        ]
 
-    @commands.hybrid_command(name="rol", description="Asigna un paquete de roles a un miembro")
-    @app_commands.describe(
-        paquete="Paquete de roles a asignar (miembro / miembroava)",
-        usuario="Miembro al que se le asignan los roles"
-    )
-    @commands.has_permissions(manage_roles=True)
-    async def asignar_paquete(self, ctx, paquete: str, usuario: discord.Member):
-        await ctx.defer(ephemeral=True)
-        try:
-            await ctx.message.delete()
-        except: pass
-
+    @commands.hybrid_command(name="rol", description="Asigna roles de golpe a un nuevo integrante")
+    @app_commands.describe(paquete="miembro o miembroava", usuario="El miembro a rankear")
+    @app_commands.autocomplete(paquete=paquete_autocomplete)
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def rol(self, ctx, paquete: str, usuario: discord.Member):
         paquete = paquete.lower()
-
         if paquete not in self.PAQUETES:
-            opciones = ", ".join(self.PAQUETES.keys())
-            await ctx.send(f"❌ Paquete no encontrado. Opciones: `{opciones}`", delete_after=5)
-            return
+            return await ctx.send(f"❌ Paquete inválido. Usa: `miembro` o `miembroava`", delete_after=5)
 
-        nombres_roles = self.PAQUETES[paquete]
-        roles_a_agregar = []
-        roles_no_encontrados = []
+        roles_a_dar = []
+        for nombre in self.PAQUETES[paquete]:
+            r = discord.utils.get(ctx.guild.roles, name=nombre)
+            if r:
+                roles_a_dar.append(r)
 
-        for nombre in nombres_roles:
-            rol = discord.utils.get(ctx.guild.roles, name=nombre)
-            if rol:
-                roles_a_agregar.append(rol)
-            else:
-                roles_no_encontrados.append(nombre)
-
-        if roles_no_encontrados:
-            nombres_faltantes = ", ".join(roles_no_encontrados)
-            await ctx.send(f"⚠️ No encontré estos roles en el servidor: **{nombres_faltantes}**.", delete_after=7)
-
-        if roles_a_agregar:
+        if roles_a_dar:
             try:
-                await usuario.add_roles(*roles_a_agregar)
-                await ctx.send(
-                    f"✅ Roles del paquete **{paquete.capitalize()}** dados a {usuario.mention}.",
-                    delete_after=5
-                )
+                await usuario.add_roles(*roles_a_dar)
+                scout = discord.utils.get(ctx.guild.roles, name="Scout")
+                if scout and scout in usuario.roles:
+                    await usuario.remove_roles(scout)
+                await ctx.send(f"✅ Se han asignado los roles de **{paquete}** a {usuario.mention}.", delete_after=10)
             except discord.Forbidden:
-                await ctx.send(
-                    "❌ Error 403: No tengo permisos. Pon mi rol por encima de los que asigno.",
-                    delete_after=5
-                )
-
-    @asignar_paquete.error
-    async def rol_error(self, ctx, error):
-        try:
-            await ctx.message.delete()
-        except: pass
-
-        if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send("❌ Uso incorrecto. Ejemplo: `!rol miembro @usuario`", delete_after=5)
-        elif isinstance(error, commands.MemberNotFound):
-            await ctx.send("❌ No pude encontrar a ese usuario. Menciónalo con `@`.", delete_after=5)
-        elif isinstance(error, commands.MissingPermissions):
-            await ctx.send("❌ No tienes permiso para gestionar roles.", delete_after=5)
+                await ctx.send("❌ Error: Verifica que el rol del bot esté arriba de los demás.")
 
 
 async def setup(bot):

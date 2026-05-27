@@ -89,10 +89,28 @@ async def restart(ctx):
 
     os.execv(sys.executable, ['python'] + sys.argv)
 
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def limpiar_comandos(ctx):
+    """Limpia los comandos globales duplicados y deja solo los del servidor."""
+    mensaje = await ctx.send("🧹 Iniciando limpieza de comandos fantasma...")
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
+    bot.tree.copy_global_to(guild=ctx.guild)
+    synced = await bot.tree.sync(guild=ctx.guild)
+    await mensaje.edit(content=f"✅ Limpieza completada. Discord global ha sido purgado y se han registrado **{len(synced)}** comandos limpios exclusivamente para este servidor.")
+
 @bot.event
 async def on_ready():
     print(f'✅ Saffe_bot encendido como: {bot.user}')
-    print(f'💡 Usa !sync [guild_id] para activar los slash commands en tu servidor.')
+    try:
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"🔄 Comandos sincronizados automáticamente en: {guild.name} ({len(synced)} comandos)")
+    except Exception as e:
+        print(f"⚠️ No se pudo sincronizar automáticamente: {e}")
+    print(f'💡 Todo listo para el gremio.')
 
 if __name__ == "__main__":
     if TOKEN:

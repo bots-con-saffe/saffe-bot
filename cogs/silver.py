@@ -2,132 +2,124 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
-from db import get_db
+import random
+from db import get_db, get_balance_lock
 
 
-def formatear(cantidad: int) -> str:
-    """Formatea un número con separadores de miles. Ej: 1500000 → 1.500.000"""
-    return f"{cantidad:,}".replace(",", ".")
+async def _actualizar_balance(member: discord.Member, cantidad: int, tipo: str, motivo: str):
+    user_id = str(member.id)
+    nombre  = member.display_name
 
+    async with get_balance_lock(user_id):
+        result = await asyncio.to_thread(
+            lambda: get_db().table('balances').select('balance').eq('usuario_id', user_id).execute()
+        )
+        balance_actual = result.data[0]['balance'] if result.data else 0
+        nuevo_balance  = balance_actual + cantidad
 
-def extraer_participantes(embed: discord.Embed) -> list[str]:
-    """Extrae los IDs de usuario de las menciones en el embed de una actividad."""
-    ids = []
-    for line in embed.description.split("\n"):
-        if "<@" in line:
-            start = line.find("<@")
-            end = line.find(">", start) + 1
-            user_id = line[start:end][2:-1].replace("!", "")
-            if user_id not in ids:
-                ids.append(user_id)
-    return ids
+        await asyncio.to_thread(
+            lambda: get_db().table('balances')
+                .upsert({'usuario_id': user_id, 'usuario_nombre': nombre, 'balance': nuevo_balance}, on_conflict='usuario_id')
+                .execute()
+        )
+        await asyncio.to_thread(
+            lambda: get_db().table('transacciones')
+                .insert({'usuario_id': user_id, 'tipo': tipo, 'cantidad': cantidad, 'motivo': motivo})
+                .execute()
+        )
 
 
 class Silver(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    # --- SPLIT ---
+    def formatear(self, cantidad: int) -> str:
+        return f"{cantidad:,}".replace(",", ".")
 
-    @commands.hybrid_command(name="split", description="Calcula y reparte el silver de una actividad entre los participantes")
-    @app_commands.describe(
-        bolsas="Silver en bolsas (sin puntos ni comas)",
-        loot="Estimado del loot en silver (sin puntos ni comas)"
-    )
-    @commands.has_any_role("Oficial", "Guild Master")
-    async def split(self, ctx, bolsas: int, loot: int = 0):
-        await ctx.defer()
-
-        if not isinstance(ctx.channel, discord.Thread):
-            return await ctx.send("❌ Usa este comando dentro del hilo de una actividad.", delete_after=5)
-
-        # Leer participantes del embed del hilo
+    def convertir_unidad(self, entrada: str) -> int:
+        """Convierte '20m', '500k', '1.5m' a entero."""
+        if isinstance(entrada, int):
+            return entrada
+        texto = str(entrada).lower().replace(" ", "")
         try:
-            parent_msg = await ctx.channel.parent.fetch_message(ctx.channel.id)
-        except Exception:
-            return await ctx.send("❌ No pude encontrar el embed de la actividad.", delete_after=5)
-
-        if not parent_msg.embeds:
-            return await ctx.send("❌ No hay un embed de actividad en este hilo.", delete_after=5)
-
-        participante_ids = extraer_participantes(parent_msg.embeds[0])
-
-        if not participante_ids:
-            return await ctx.send("❌ No hay participantes anotados en la actividad.", delete_after=5)
-
-        # Cálculo
-        total_bruto = bolsas + loot
-        descuento = int(total_bruto * 0.15)
-        total_neto = total_bruto - descuento
-        por_persona = total_neto // len(participante_ids)
-
-        # Obtener miembros del servidor para mostrar nombres
-        menciones = [f"<@{uid}>" for uid in participante_ids]
-
-        embed = discord.Embed(title="💰 Resumen del Split", color=discord.Color.gold())
-        embed.add_field(name="Silver en bolsas", value=formatear(bolsas), inline=True)
-        embed.add_field(name="Estimado loot", value=formatear(loot), inline=True)
-        embed.add_field(name="Total bruto", value=formatear(total_bruto), inline=False)
-        embed.add_field(name="Descuento guild (15%)", value=f"-{formatear(descuento)}", inline=True)
-        embed.add_field(name="Total neto", value=formatear(total_neto), inline=True)
-        embed.add_field(
-            name=f"Por persona ({len(participante_ids)} participantes)",
-            value=f"**{formatear(por_persona)}** silver",
-            inline=False
-        )
-        embed.add_field(name="Participantes", value=" ".join(menciones), inline=False)
-        embed.set_footer(text="¿Confirmas el reparto?")
-
-        view = ConfirmacionSplit(
-            participante_ids=participante_ids,
-            por_persona=por_persona,
-            actividad=parent_msg.embeds[0].title,
-            guild=ctx.guild
-        )
-        await ctx.send(embed=embed, view=view)
+            if texto.endswith('k'):
+                return int(float(texto[:-1].replace(",", ".")) * 1_000)
+            if texto.endswith('m'):
+                return int(float(texto[:-1].replace(",", ".")) * 1_000_000)
+            return int(float(texto.replace(",", ".")))
+        except:
+            return 0
 
     # --- BALANCE ---
 
-    @commands.hybrid_command(name="balance", description="Consulta el balance de silver acumulado")
-    @app_commands.describe(usuario="Miembro a consultar (solo Oficial/GM)")
+    @commands.hybrid_command(name="balance", description="Consulta el silver acumulado")
+    @app_commands.describe(usuario="Miembro a consultar (solo Oficial/GM para ver el de otro)")
     async def balance(self, ctx, usuario: discord.Member = None):
         await ctx.defer(ephemeral=True)
 
-        # Si se especifica otro usuario, requiere rol
         if usuario and usuario != ctx.author:
-            roles_permitidos = ["Oficial", "Guild Master"]
-            if not any(r.name in roles_permitidos for r in ctx.author.roles):
+            if not any(r.name in ["Oficial", "Guild Master"] for r in ctx.author.roles):
                 return await ctx.send("❌ Solo Oficiales y Guild Masters pueden consultar el balance de otros.", delete_after=5)
             target = usuario
         else:
             target = ctx.author
 
         result = await asyncio.to_thread(
-            lambda: get_db().table('balances')
-                .select('balance')
-                .eq('usuario_id', str(target.id))
-                .execute()
+            lambda: get_db().table('balances').select('balance').eq('usuario_id', str(target.id)).execute()
         )
+        saldo = result.data[0]['balance'] if result.data else 0
+        await ctx.send(embed=discord.Embed(
+            title=f"💰 Balance de {target.display_name}",
+            description=f"**{self.formatear(saldo)}** silver",
+            color=discord.Color.gold()
+        ))
 
-        balance = result.data[0]['balance'] if result.data else 0
+    @commands.hybrid_command(name="balance_total_gremio", description="Suma total de silver que el gremio debe pagar a los miembros")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def balance_total_gremio(self, ctx):
+        await ctx.defer()
+        result = await asyncio.to_thread(
+            lambda: get_db().table('balances').select('usuario_id, usuario_nombre, balance').execute()
+        )
+        if not result.data:
+            return await ctx.send("📊 La base de datos de balances está vacía.")
+
+        deuda_total = 0
+        detalles = []
+        for row in result.data:
+            saldo = row.get('balance', 0)
+            if saldo > 0:
+                deuda_total += saldo
+                detalles.append((row.get('usuario_nombre', 'Desconocido'), saldo))
+
+        if deuda_total == 0:
+            return await ctx.send(embed=discord.Embed(
+                title="📈 Balance General del Gremio",
+                description="✅ **¡El gremio está al día!** No se le debe silver a nadie.",
+                color=discord.Color.green()
+            ))
+
+        detalles.sort(key=lambda x: -x[1])
+        lineas = [f"• **{nombre}**: {self.formatear(saldo)} silver" for nombre, saldo in detalles[:30]]
+        if len(detalles) > 30:
+            lineas.append(f"*... y {len(detalles) - 30} usuarios más.*")
 
         embed = discord.Embed(
-            title=f"💰 Balance de {target.display_name}",
-            description=f"**{formatear(balance)}** silver",
-            color=discord.Color.gold()
+            title="📊 Reporte de Deuda Pendiente del Gremio",
+            description=f"💰 **Total a Pagar:** {self.formatear(deuda_total)} silver\n👥 **Jugadores con saldo:** {len(detalles)}",
+            color=discord.Color.red()
         )
+        embed.add_field(name="📋 Desglose de Cuentas Pendientes", value="\n".join(lineas), inline=False)
+        embed.set_footer(text="Usa /pay [usuario] para saldar la cuenta de alguien.")
         await ctx.send(embed=embed)
 
-    # --- HISTORIAL ---
-
     @commands.hybrid_command(name="historial", description="Muestra las últimas transacciones de silver")
-    @app_commands.describe(usuario="Miembro a consultar (solo Oficial/GM)")
+    @app_commands.describe(usuario="Miembro a consultar (solo Oficial/GM para ver el de otro)")
     async def historial(self, ctx, usuario: discord.Member = None):
         await ctx.defer(ephemeral=True)
 
         if usuario and usuario != ctx.author:
-            roles_permitidos = ["Oficial", "Guild Master"]
-            if not any(r.name in roles_permitidos for r in ctx.author.roles):
+            if not any(r.name in ["Oficial", "Guild Master"] for r in ctx.author.roles):
                 return await ctx.send("❌ Solo Oficiales y Guild Masters pueden ver el historial de otros.", delete_after=5)
             target = usuario
         else:
@@ -141,7 +133,6 @@ class Silver(commands.Cog):
                 .limit(10)
                 .execute()
         )
-
         if not result.data:
             return await ctx.send(f"No hay transacciones registradas para **{target.display_name}**.", delete_after=7)
 
@@ -150,103 +141,271 @@ class Silver(commands.Cog):
             signo = "+" if tx['cantidad'] > 0 else ""
             fecha = tx['fecha'][:10]
             embed.add_field(
-                name=f"{signo}{formatear(tx['cantidad'])} silver — {fecha}",
+                name=f"{signo}{self.formatear(tx['cantidad'])} silver — {fecha}",
                 value=f"`{tx['tipo']}` · {tx['motivo'] or 'Sin motivo'}",
                 inline=False
             )
         await ctx.send(embed=embed)
 
-    # --- ADD / REMOVE BALANCE ---
+    # --- SPLIT ---
 
-    @commands.hybrid_command(name="addbalance", description="Suma silver al balance de un miembro manualmente")
+    @commands.hybrid_command(name="split", description="Reparte silver, registra asistencia y cierra la actividad")
     @app_commands.describe(
-        usuario="Miembro al que sumar silver",
-        cantidad="Cantidad de silver a sumar",
-        motivo="Motivo del ajuste"
+        bolsas="Silver en bolsas (Ej: 20m, 500k)",
+        loot="Estimado del loot (Ej: 5m)",
+        costo_mapa="Costo del mapa (Ej: 500k)",
+        tax_porcentaje="% de tax del gremio sobre el loot (Ej: 15)",
+        venta_rapida="% de descuento aplicado al loot por venta rápida",
+        excluir="Miembro a excluir del reparto"
     )
     @commands.has_any_role("Oficial", "Guild Master")
-    async def addbalance(self, ctx, usuario: discord.Member, cantidad: int, *, motivo: str = "Ajuste manual"):
-        await ctx.defer(ephemeral=True)
-        await _actualizar_balance(usuario, cantidad, "ajuste_manual", motivo)
-        await ctx.send(f"✅ Se sumaron **{formatear(cantidad)}** silver a {usuario.mention}.", delete_after=5)
+    async def split(self, ctx, bolsas: str, loot: str, costo_mapa: str = "0", tax_porcentaje: int = 15, venta_rapida: int = 0, excluir: discord.Member = None):
+        if not isinstance(ctx.channel, discord.Thread):
+            return await ctx.send("❌ Usa esto en un hilo activo.", delete_after=5)
+        await ctx.defer()
 
-    @commands.hybrid_command(name="removebalance", description="Resta silver del balance de un miembro manualmente")
-    @app_commands.describe(
-        usuario="Miembro al que restar silver",
-        cantidad="Cantidad de silver a restar",
-        motivo="Motivo del ajuste"
-    )
-    @commands.has_any_role("Oficial", "Guild Master")
-    async def removebalance(self, ctx, usuario: discord.Member, cantidad: int, *, motivo: str = "Ajuste manual"):
-        await ctx.defer(ephemeral=True)
-        await _actualizar_balance(usuario, -cantidad, "ajuste_manual", motivo)
-        await ctx.send(f"✅ Se restaron **{formatear(cantidad)}** silver a {usuario.mention}.", delete_after=5)
+        hilo_id = str(ctx.channel.id)
+        result = await asyncio.to_thread(
+            lambda: get_db().table('registros_activos').select('*').eq('hilo_id', hilo_id).execute()
+        )
+        if not result.data:
+            return await ctx.send("❌ No hay una actividad activa registrada en este hilo.")
 
+        registro = result.data[0]
+        ids_validos = [uid for uid in registro['participantes'].values() if uid is not None]
 
-# --- FUNCIÓN AUXILIAR ---
+        participantes = []
+        for uid in ids_validos:
+            if excluir and str(excluir.id) == uid:
+                continue
+            m = ctx.guild.get_member(int(uid))
+            if m and not m.bot:
+                participantes.append(m)
 
-async def _actualizar_balance(member: discord.Member, cantidad: int, tipo: str, motivo: str):
-    """Actualiza el balance de un usuario y registra la transacción."""
-    user_id = str(member.id)
-    nombre = member.display_name
+        if not participantes:
+            return await ctx.send("❌ No hay miembros anotados para efectuar el reparto.")
 
-    # Obtener balance actual
-    result = await asyncio.to_thread(
-        lambda: get_db().table('balances')
-            .select('balance')
-            .eq('usuario_id', user_id)
-            .execute()
-    )
+        v_bolsas = self.convertir_unidad(bolsas)
+        v_loot = self.convertir_unidad(loot)
+        v_costo_mapa = self.convertir_unidad(costo_mapa)
 
-    balance_actual = result.data[0]['balance'] if result.data else 0
-    nuevo_balance = balance_actual + cantidad
+        loot_inicial = int(v_loot * (1 - venta_rapida / 100))
+        mapa_pendiente = v_costo_mapa
 
-    # Upsert balance
-    await asyncio.to_thread(
-        lambda: get_db().table('balances')
-            .upsert({'usuario_id': user_id, 'usuario_nombre': nombre, 'balance': nuevo_balance}, on_conflict='usuario_id')
-            .execute()
-    )
+        cobrado_bolsas = min(v_bolsas, mapa_pendiente)
+        bolsas_restantes = v_bolsas - cobrado_bolsas
+        mapa_pendiente -= cobrado_bolsas
 
-    # Registrar transacción
-    await asyncio.to_thread(
-        lambda: get_db().table('transacciones')
-            .insert({'usuario_id': user_id, 'tipo': tipo, 'cantidad': cantidad, 'motivo': motivo})
-            .execute()
-    )
+        cobrado_loot = min(loot_inicial, mapa_pendiente)
+        loot_restante = loot_inicial - cobrado_loot
 
+        tax = int(loot_restante * (tax_porcentaje / 100))
+        loot_final = loot_restante - tax
 
-# --- BOTONES DE CONFIRMACIÓN DEL SPLIT ---
+        total_neto = max(0, bolsas_restantes + loot_final)
+        por_persona = total_neto // len(participantes)
 
-class ConfirmacionSplit(discord.ui.View):
-    def __init__(self, participante_ids: list[str], por_persona: int, actividad: str, guild: discord.Guild):
-        super().__init__(timeout=60)
-        self.participante_ids = participante_ids
-        self.por_persona = por_persona
-        self.actividad = actividad
-        self.guild = guild
+        lista_pagos = ""
+        for p in participantes:
+            await _actualizar_balance(p, por_persona, "split", f"Split: {ctx.channel.name}")
+            lista_pagos += f"{p.mention}: **{self.formatear(por_persona)}**\n"
 
-    @discord.ui.button(label="Confirmar reparto", style=discord.ButtonStyle.success)
-    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        roles_permitidos = ["Oficial", "Guild Master"]
-        if not any(r.name in roles_permitidos for r in interaction.user.roles):
-            return await interaction.response.send_message("❌ Solo Oficiales y Guild Masters pueden confirmar el reparto.", ephemeral=True)
-
-        await interaction.response.edit_message(content="⏳ Procesando...", embed=None, view=None)
-
-        for user_id in self.participante_ids:
-            member = self.guild.get_member(int(user_id))
-            if member:
-                await _actualizar_balance(member, self.por_persona, "split", f"Split: {self.actividad}")
-
-        await interaction.edit_original_response(
-            content=f"✅ Split confirmado. Se repartieron **{formatear(self.por_persona)}** silver a {len(self.participante_ids)} participantes."
+        # Registrar asistencias
+        asistencias_data = [{
+            'registro_actividad_id': registro['registro_actividad_id'],
+            'usuario_id': str(p.id),
+            'usuario_nombre': p.display_name
+        } for p in participantes]
+        await asyncio.to_thread(
+            lambda: get_db().table('asistencias').insert(asistencias_data).execute()
         )
 
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
-    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="❌ Split cancelado.", embed=None, view=None)
+        # Cerrar actividad
+        pings_cog = self.bot.get_cog("PingsAlbion")
+        if pings_cog:
+            await pings_cog.actualizar_mensaje(ctx.channel, registro, estado="finalizada")
 
+        await asyncio.to_thread(
+            lambda: get_db().table('registros_activos').delete().eq('hilo_id', hilo_id).execute()
+        )
+
+        embed = discord.Embed(title="💰 Reparto Avanzado y Asistencia Registrada", color=discord.Color.green())
+        resumen = (
+            f"**Bolsas iniciales:** {self.formatear(v_bolsas)}\n"
+            f"**Loot neto recaudado:** {self.formatear(loot_inicial)}\n"
+            f"**Costo de mapa:** -{self.formatear(v_costo_mapa)} *(cobrado de las bolsas primero)*\n"
+            f"**Tax gremio ({tax_porcentaje}% del loot):** -{self.formatear(tax)}\n"
+            f"**Total neto a repartir:** {self.formatear(total_neto)}"
+        )
+        embed.add_field(name="Resumen de Operación", value=resumen, inline=False)
+        embed.add_field(name="👥 Distribución Detallada", value=lista_pagos, inline=False)
+        embed.set_footer(text="Contenido completado. Hilo archivado.")
+
+        await ctx.send(embed=embed)
+        await ctx.channel.edit(locked=True, archived=True)
+
+    @commands.hybrid_command(name="split_medio", description="Reparte silver y registra asistencia SIN cerrar la actividad")
+    @app_commands.describe(
+        bolsas="Silver en bolsas (Ej: 20m, 500k)",
+        loot="Estimado del loot (Ej: 5m)",
+        costo_mapa="Costo del mapa (Ej: 500k)",
+        tax_porcentaje="% de tax del gremio sobre el loot (Ej: 15)",
+        venta_rapida="% de descuento aplicado al loot por venta rápida",
+        excluir="Miembro a excluir del reparto"
+    )
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def split_medio(self, ctx, bolsas: str, loot: str, costo_mapa: str = "0", tax_porcentaje: int = 15, venta_rapida: int = 0, excluir: discord.Member = None):
+        if not isinstance(ctx.channel, discord.Thread):
+            return await ctx.send("❌ Usa esto en un hilo activo.", delete_after=5)
+        await ctx.defer()
+
+        hilo_id = str(ctx.channel.id)
+        result = await asyncio.to_thread(
+            lambda: get_db().table('registros_activos').select('*').eq('hilo_id', hilo_id).execute()
+        )
+        if not result.data:
+            return await ctx.send("❌ No hay una actividad activa registrada en este hilo.")
+
+        registro = result.data[0]
+        ids_validos = [uid for uid in registro['participantes'].values() if uid is not None]
+
+        participantes = []
+        for uid in ids_validos:
+            if excluir and str(excluir.id) == uid:
+                continue
+            m = ctx.guild.get_member(int(uid))
+            if m and not m.bot:
+                participantes.append(m)
+
+        if not participantes:
+            return await ctx.send("❌ No hay miembros anotados para efectuar el reparto parcial.")
+
+        v_bolsas = self.convertir_unidad(bolsas)
+        v_loot = self.convertir_unidad(loot)
+        v_costo_mapa = self.convertir_unidad(costo_mapa)
+
+        loot_inicial = int(v_loot * (1 - venta_rapida / 100))
+        mapa_pendiente = v_costo_mapa
+
+        cobrado_bolsas = min(v_bolsas, mapa_pendiente)
+        bolsas_restantes = v_bolsas - cobrado_bolsas
+        mapa_pendiente -= cobrado_bolsas
+
+        cobrado_loot = min(loot_inicial, mapa_pendiente)
+        loot_restante = loot_inicial - cobrado_loot
+
+        tax = int(loot_restante * (tax_porcentaje / 100))
+        loot_final = loot_restante - tax
+
+        total_neto = max(0, bolsas_restantes + loot_final)
+        por_persona = total_neto // len(participantes)
+
+        lista_pagos = ""
+        for p in participantes:
+            await _actualizar_balance(p, por_persona, "split_medio", f"Split Parcial: {ctx.channel.name}")
+            lista_pagos += f"{p.mention}: **{self.formatear(por_persona)}**\n"
+
+        # Registrar asistencias
+        asistencias_data = [{
+            'registro_actividad_id': registro['registro_actividad_id'],
+            'usuario_id': str(p.id),
+            'usuario_nombre': p.display_name
+        } for p in participantes]
+        await asyncio.to_thread(
+            lambda: get_db().table('asistencias').insert(asistencias_data).execute()
+        )
+
+        embed = discord.Embed(
+            title="⏳ Reparto Parcial Completado",
+            description="La actividad **SIGUE ABIERTA**. Puedes modificar la plantilla y hacer otro split.",
+            color=discord.Color.orange()
+        )
+        resumen = (
+            f"**Bolsas iniciales:** {self.formatear(v_bolsas)}\n"
+            f"**Loot neto recaudado:** {self.formatear(loot_inicial)}\n"
+            f"**Costo de mapa:** -{self.formatear(v_costo_mapa)} *(cobrado de las bolsas primero)*\n"
+            f"**Tax gremio ({tax_porcentaje}% del loot):** -{self.formatear(tax)}\n"
+            f"**Total neto a repartir:** {self.formatear(total_neto)}"
+        )
+        embed.add_field(name="Resumen de Operación", value=resumen, inline=False)
+        embed.add_field(name="👥 Distribución Detallada", value=lista_pagos, inline=False)
+        embed.set_footer(text="Usa /desanotar para liberar puestos antes del próximo split.")
+        await ctx.send(embed=embed)
+
+    # --- GESTIÓN DE BALANCES ---
+
+    @commands.hybrid_command(name="pay", description="Salda la deuda pendiente de un miembro")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def pay(self, ctx, usuario: discord.Member):
+        result = await asyncio.to_thread(
+            lambda: get_db().table('balances').select('balance').eq('usuario_id', str(usuario.id)).execute()
+        )
+        if not result.data or result.data[0]['balance'] <= 0:
+            return await ctx.send("❌ Este miembro no tiene balance pendiente.")
+        deuda = result.data[0]['balance']
+        await _actualizar_balance(usuario, -deuda, "pago", "Pago total de deuda")
+        await ctx.send(f"✅ Pagados **{self.formatear(deuda)}** silver a {usuario.mention}.")
+
+    @commands.hybrid_command(name="discount", description="Aplica una multa o descuento manual al balance de un miembro")
+    @app_commands.describe(usuario="El miembro", cantidad="Cantidad a descontar (Ej: 500k, 1m)", motivo="Razón del descuento")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def discount(self, ctx, usuario: discord.Member, cantidad: str, *, motivo: str = "Descuento"):
+        valor = self.convertir_unidad(cantidad)
+        await _actualizar_balance(usuario, -valor, "descuento", motivo)
+        await ctx.send(f"📉 Descontados **{self.formatear(valor)}** a {usuario.mention}. Motivo: *{motivo}*")
+
+    @commands.hybrid_command(name="addbalance", description="Suma silver al balance de un miembro manualmente")
+    @app_commands.describe(usuario="El miembro", cantidad="Cantidad a sumar (Ej: 500k, 1m)", motivo="Razón del ajuste")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def addbalance(self, ctx, usuario: discord.Member, cantidad: str, *, motivo: str = "Ajuste manual"):
+        valor = self.convertir_unidad(cantidad)
+        await _actualizar_balance(usuario, valor, "ajuste_manual", motivo)
+        await ctx.send(f"✅ Sumados **{self.formatear(valor)}** silver a {usuario.mention}.")
+
+    @commands.hybrid_command(name="removebalance", description="Resta silver del balance de un miembro manualmente")
+    @app_commands.describe(usuario="El miembro", cantidad="Cantidad a restar (Ej: 500k, 1m)", motivo="Razón del ajuste")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def removebalance(self, ctx, usuario: discord.Member, cantidad: str, *, motivo: str = "Ajuste manual"):
+        valor = self.convertir_unidad(cantidad)
+        await _actualizar_balance(usuario, -valor, "ajuste_manual", motivo)
+        await ctx.send(f"✅ Restados **{self.formatear(valor)}** silver a {usuario.mention}.")
+
+    @commands.hybrid_command(name="remove_balance", description="Resetea el balance de un miembro a cero sin registrar transacción")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def remove_balance(self, ctx, usuario: discord.Member):
+        await asyncio.to_thread(
+            lambda: get_db().table('balances')
+                .update({'balance': 0})
+                .eq('usuario_id', str(usuario.id))
+                .execute()
+        )
+        await ctx.send(f"♻️ Balance reseteado a 0 para {usuario.mention}.")
+
+    @commands.hybrid_command(name="wipe_silver", description="⚠️ Borra TODOS los balances de silver del servidor")
+    @commands.has_permissions(administrator=True)
+    async def wipe_silver(self, ctx):
+        await ctx.defer()
+        await asyncio.to_thread(
+            lambda: get_db().table('balances').delete().neq('usuario_id', '').execute()
+        )
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ WIPE DE SILVER COMPLETADO",
+            description="Se han reseteado todos los balances de silver del servidor.",
+            color=discord.Color.red()
+        ))
+
+    @commands.hybrid_command(name="wipe_asistencias", description="⚠️ Borra TODAS las asistencias de los miembros")
+    @commands.has_permissions(administrator=True)
+    async def wipe_asistencias(self, ctx):
+        await ctx.defer()
+        await asyncio.to_thread(
+            lambda: get_db().table('asistencias').delete().neq('usuario_id', '').execute()
+        )
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ WIPE DE ASISTENCIAS COMPLETADO",
+            description="Se han eliminado todos los registros de asistencia del servidor.",
+            color=discord.Color.red()
+        ))
 
 async def setup(bot):
     await bot.add_cog(Silver(bot))
