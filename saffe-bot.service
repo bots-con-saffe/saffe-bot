@@ -1,0 +1,15 @@
+[Unit]
+Description=Saffe Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=saffe
+WorkingDirectory=/home/saffe/saffe-bot
+ExecStart=/home/saffe/saffe-bot/.venv/bin/python bot_saffe.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
