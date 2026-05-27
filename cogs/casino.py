@@ -169,6 +169,7 @@ class Casino(commands.Cog):
         asyncio.create_task(self._jugar_ruleta(ctx, view, msg, valor))
 
     async def _jugar_ruleta(self, ctx, view: "RuletaView", msg: discord.Message, valor: int):
+        mensajes_tmp = []
         try:
             await view.wait()
 
@@ -181,25 +182,10 @@ class Casino(commands.Cog):
                 ), view=None)
                 return
 
-            await msg.edit(view=None)
-
-            intro = await ctx.send(embed=discord.Embed(
-                description=(
-                    "```\n"
-                    "╔══════════════════════════════╗\n"
-                    "║  🔫  RULETA RUSA COMIENZA  🔫 ║\n"
-                    "║                              ║\n"
-                    "║    ○ ○ ○ 💀 ○ ○             ║\n"
-                    "║    El tambor gira...         ║\n"
-                    "╚══════════════════════════════╝\n"
-                    "```"
-                ),
-                color=discord.Color.dark_red()
-            ))
-            await asyncio.sleep(3)
-            await intro.delete()
+            await msg.delete()
 
             jugadores_vivos = view.jugadores.copy()
+            eliminados      = []
             random.shuffle(jugadores_vivos)
             idx = 0
 
@@ -213,83 +199,42 @@ class Casino(commands.Cog):
                         idx = 0
                     jugador = jugadores_vivos[idx]
 
-                    cargador_str = " ".join(
-                        "💀" if i + 1 == bala else ("●" if i < tambor else "○")
-                        for i in range(6)
-                    )
-
-                    turno = await ctx.send(embed=discord.Embed(
-                        description=(
-                            f"```\n"
-                            f"  {cargador_str}\n"
-                            f"```\n"
-                            f"😰 **{jugador.display_name}** toma el arma..."
-                        ),
-                        color=discord.Color.orange()
-                    ))
-                    await asyncio.sleep(2)
-
-                    await turno.edit(embed=discord.Embed(
-                        description=(
-                            "```\n"
-                            "        ___________\n"
-                            "       /           \\\n"
-                            "  🔫 → │  apunta... │\n"
-                            "       \\___________/\n"
-                            "```\n"
-                            f"**{jugador.display_name}** aprieta el gatillo..."
-                        ),
-                        color=discord.Color.dark_red()
-                    ))
+                    m = await ctx.send(f"🔫 **{jugador.display_name}** aprieta el gatillo...")
+                    mensajes_tmp.append(m)
                     await asyncio.sleep(2)
 
                     if tambor == bala:
-                        await turno.edit(embed=discord.Embed(
-                            title="💥  ¡ B A N G !  💥",
-                            description=(
-                                "```\n"
-                                "╔══════════════════════════╗\n"
-                                f"║  💀  {jugador.display_name[:18].upper().center(18)}  ║\n"
-                                "║         HA CAÍDO          ║\n"
-                                "╚══════════════════════════╝\n"
-                                "```"
-                            ),
-                            color=discord.Color.red()
-                        ))
+                        await m.edit(content=f"💥 **{jugador.display_name}** ha caído.")
+                        eliminados.append(jugador)
                         jugadores_vivos.remove(jugador)
                         ronda_activa = False
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(1)
                     else:
-                        await turno.edit(embed=discord.Embed(
-                            description=(
-                                "```\n"
-                                "  💨  c l i c k . . .\n"
-                                "```\n"
-                                f"😮‍💨 **{jugador.display_name}** cierra los ojos, suspira... y pasa el arma."
-                            ),
-                            color=discord.Color.green()
-                        ))
+                        await m.edit(content=f"😮‍💨 **{jugador.display_name}** — *click*. Sigue vivo.")
                         tambor += 1
                         idx    += 1
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)
+
+            # Borrar todos los mensajes intermedios
+            for m in mensajes_tmp:
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
 
             ganador = jugadores_vivos[0]
             bote    = valor * len(view.jugadores)
             await _actualizar_balance(ganador, bote, "premio_ruleta", "Premio Mayor Ruleta Rusa")
 
-            nombre = ganador.display_name[:16].upper().center(16)
-            await ctx.send(embed=discord.Embed(
-                title="🏆 ¡ÚLTIMO SUPERVIVIENTE!",
-                description=(
-                    "```\n"
-                    "╔════════════════════════╗\n"
-                    f"║  🏆  {nombre}  🏆  ║\n"
-                    "╚════════════════════════╝\n"
-                    "```\n"
-                    f"{ganador.mention} sale vivo y se lleva **{self.fmt(bote)} silver**."
-                ),
-                color=discord.Color.gold()
-            ))
+            resumen_eliminados = "\n".join(f"💀 {j.display_name}" for j in eliminados)
+            embed = discord.Embed(title="🔫 Ruleta Rusa — Resultado", color=discord.Color.dark_red())
+            embed.add_field(name="Eliminados", value=resumen_eliminados or "—", inline=False)
+            embed.add_field(
+                name="🏆 Superviviente",
+                value=f"{ganador.mention} se lleva **{self.fmt(bote)} silver**",
+                inline=False
+            )
+            await ctx.send(embed=embed)
 
         except Exception as e:
             try:
