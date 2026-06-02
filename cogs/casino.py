@@ -68,6 +68,13 @@ class Casino(commands.Cog):
         )
         return r.data[0]["balance"] if r.data else 0
 
+    async def get_user_balance(self, user_id: str) -> int:
+        r = await asyncio.to_thread(
+            lambda: get_db().table("balances").select("balance")
+                .eq("usuario_id", user_id).execute()
+        )
+        return r.data[0]["balance"] if r.data else 0
+
     async def mover_banco(self, cantidad: int, tipo: str, motivo: str):
         async with get_balance_lock(BANCO_ID):
             banco = await self.get_banco()
@@ -309,10 +316,9 @@ class Casino(commands.Cog):
             if tu_dado > casa_dado:
                 titulo = "🎲 ¡GANASTE!"
                 color  = discord.Color.green()
-                delta  = valor
                 await _actualizar_balance(ctx.author, valor * 2, "premio_casino", f"Dados — ganancia +{self.fmt(valor)}")
                 await self.mover_banco(-valor * 2, "pago_casino", f"Dados — pago a {ctx.author.display_name}")
-                resultado = f"✅ **+{self.fmt(delta)} silver**"
+                resultado = f"✅ **+{self.fmt(valor)} silver**"
             elif tu_dado < casa_dado:
                 titulo    = "🎲 PERDISTE"
                 color     = discord.Color.red()
@@ -324,13 +330,15 @@ class Casino(commands.Cog):
                 await self.mover_banco(-valor, "empate_casino", "Dados — Empate")
                 resultado = "↩️ Se devuelve tu apuesta"
 
+            saldo_actual = await self.get_user_balance(str(ctx.author.id))
             desc = (
                 "```\n"
                 f"  TÚ              CASA\n"
                 f"   {DADO_EMO[tu_dado]}    vs    {DADO_EMO[casa_dado]}\n"
                 f"   {tu_dado}    vs    {casa_dado}\n"
                 "```\n"
-                f"{resultado}"
+                f"{resultado}\n"
+                f"💰 Balance: **{self.fmt(saldo_actual)} silver**"
             )
             await msg.edit(embed=discord.Embed(title=titulo, description=desc, color=color))
 
@@ -365,16 +373,17 @@ class Casino(commands.Cog):
                 if total_c == 21:
                     await _actualizar_balance(ctx.author, valor, "empate_casino", "BJ Natural — Empate")
                     await self.mover_banco(-valor, "empate_casino", "BJ Natural — Empate")
-                    titulo, color, extra = "🃏 EMPATE — Ambos tienen Blackjack", discord.Color.greyple(), "Se devuelve tu apuesta."
+                    titulo, color, resultado = "🃏 EMPATE — Ambos tienen Blackjack", discord.Color.greyple(), "↩️ Se devuelve tu apuesta."
                 else:
                     premio = int(valor * 1.5)
                     await _actualizar_balance(ctx.author, valor + premio, "premio_casino", f"BJ Natural +{self.fmt(premio)}")
                     await self.mover_banco(-(valor + premio), "pago_casino", f"BJ Natural a {ctx.author.display_name}")
-                    titulo, color, extra = "🃏 ¡BLACKJACK NATURAL! 🎉", discord.Color.gold(), f"Ganas **{self.fmt(premio)}** silver extra."
+                    titulo, color, resultado = "🃏 ¡BLACKJACK NATURAL! 🎉", discord.Color.gold(), f"✅ Ganas **{self.fmt(premio)}** silver extra."
+                saldo_actual = await self.get_user_balance(str(ctx.author.id))
                 embed = self._embed_bj(mano_j, mano_c, total_j, total_c, False)
                 embed.title       = titulo
                 embed.color       = color
-                embed.description = extra
+                embed.description = f"{resultado}\n💰 Balance: **{self.fmt(saldo_actual)} silver**"
                 return await ctx.send(embed=embed)
 
             view      = BlackjackView(self, mano_j, mano_c, baraja, valor, ctx)
@@ -470,9 +479,10 @@ class BlackjackView(discord.ui.View):
 
     async def on_timeout(self):
         if self.msg:
+            saldo_actual = await self.cog.get_user_balance(str(self.ctx.author.id))
             await self.msg.edit(embed=discord.Embed(
                 title="🃏 Tiempo agotado — Perdiste",
-                description="No respondiste a tiempo. La apuesta se pierde.",
+                description=f"No respondiste a tiempo. La apuesta se pierde.\n❌ **-{self.cog.fmt(self.valor)} silver**\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**",
                 color=discord.Color.red()
             ), view=None)
         self.cog.jugando.discard(str(self.ctx.author.id))
@@ -485,24 +495,30 @@ class BlackjackView(discord.ui.View):
         total_c = calcular_mano(self.mano_c)
         embed   = self.cog._embed_bj(self.mano_j, self.mano_c, total_j, total_c, False)
 
+        resultado_str = ""
         if total_j > 21:
             embed.title = "🃏 ¡TE PASASTE! Perdiste."
             embed.color = discord.Color.red()
+            resultado_str = f"❌ **-{self.cog.fmt(self.valor)} silver**"
         elif total_c > 21 or total_j > total_c:
-            embed.title       = "🃏 ¡GANASTE!"
-            embed.color       = discord.Color.green()
-            embed.description = f"Ganancia: **+{self.cog.fmt(self.valor)}** silver"
+            embed.title = "🃏 ¡GANASTE!"
+            embed.color = discord.Color.green()
+            resultado_str = f"✅ **+{self.cog.fmt(self.valor)} silver**"
             await _actualizar_balance(self.ctx.author, self.valor * 2, "premio_casino", f"BJ win +{self.cog.fmt(self.valor)}")
             await self.cog.mover_banco(-self.valor * 2, "pago_casino", f"BJ pago a {self.ctx.author.display_name}")
         elif total_j == total_c:
-            embed.title       = "🃏 EMPATE — Se devuelve tu apuesta"
-            embed.color       = discord.Color.greyple()
+            embed.title = "🃏 EMPATE — Se devuelve tu apuesta"
+            embed.color = discord.Color.greyple()
+            resultado_str = "↩️ Se devuelve tu apuesta"
             await _actualizar_balance(self.ctx.author, self.valor, "empate_casino", "BJ Empate")
             await self.cog.mover_banco(-self.valor, "empate_casino", "BJ Empate")
         else:
             embed.title = "🃏 PERDISTE"
             embed.color = discord.Color.red()
+            resultado_str = f"❌ **-{self.cog.fmt(self.valor)} silver**"
 
+        saldo_actual = await self.cog.get_user_balance(str(self.ctx.author.id))
+        embed.description = f"{resultado_str}\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
         await self.msg.edit(embed=embed, view=None)
         self.stop()
 
@@ -518,6 +534,8 @@ class BlackjackView(discord.ui.View):
             embed = self.cog._embed_bj(self.mano_j, self.mano_c, total, calcular_mano(self.mano_c), False)
             embed.title = "🃏 ¡TE PASASTE! Perdiste."
             embed.color = discord.Color.red()
+            saldo_actual = await self.cog.get_user_balance(str(self.ctx.author.id))
+            embed.description = f"❌ **-{self.cog.fmt(self.valor)} silver**\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
             await self.msg.edit(embed=embed, view=None)
             self.stop()
         else:
@@ -537,18 +555,20 @@ class BlackjackView(discord.ui.View):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("❌ No es tu juego.", ephemeral=True)
 
+        await interaction.response.defer()
+
         r = await asyncio.to_thread(
             lambda: get_db().table("balances").select("balance")
                 .eq("usuario_id", str(self.ctx.author.id)).execute()
         )
         saldo = r.data[0]["balance"] if r.data else 0
         if saldo < self.valor:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ No tienes suficiente silver para doblar ({self.cog.fmt(self.valor)} requerido).", ephemeral=True
             )
         banco = await self.cog.get_banco()
-        if banco < self.valor * 4:
-            return await interaction.response.send_message(
+        if banco < self.valor * 3:
+            return await interaction.followup.send(
                 "❌ El banco no tiene fondos para cubrir la apuesta doble.", ephemeral=True
             )
 
@@ -556,8 +576,7 @@ class BlackjackView(discord.ui.View):
         await self.cog.mover_banco(self.valor, "ingreso_casino", "Doble Blackjack")
         self.valor *= 2
 
-        self.mano_j.append(self.baraja.pop())   # solo una carta más al doblar
-        await interaction.response.defer()
+        self.mano_j.append(self.baraja.pop())
         await self._resolver(interaction)
 
 

@@ -79,7 +79,8 @@ class Silver(commands.Cog):
     async def balance_total_gremio(self, ctx):
         await ctx.defer()
         result = await asyncio.to_thread(
-            lambda: get_db().table('balances').select('usuario_id, usuario_nombre, balance').execute()
+            lambda: get_db().table('balances').select('usuario_id, usuario_nombre, balance')
+                .neq('usuario_id', 'BANCO_GREMIO').execute()
         )
         if not result.data:
             return await ctx.send("📊 La base de datos de balances está vacía.")
