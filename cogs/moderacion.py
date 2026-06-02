@@ -23,11 +23,13 @@ class Moderacion(commands.Cog):
             await ctx.send(msg, delete_after=3)
 
     @commands.hybrid_command(name="callout", description="Cancela la actividad activa del hilo")
-    @app_commands.describe(motivo="Razón de la cancelación")
+    @app_commands.describe(motivo="Razón de la cancelación", asistencia="Registrar asistencia a los anotados antes de cancelar")
     @commands.has_any_role("Oficial", "Guild Master", "Creador de Contenido")
-    async def callout(self, ctx, motivo: str):
+    async def callout(self, ctx, motivo: str, asistencia: bool = False):
         if not isinstance(ctx.channel, discord.Thread):
             return await ctx.send("❌ Usa esto en un hilo.")
+
+        await ctx.defer()
 
         hilo_id = str(ctx.channel.id)
         result = await asyncio.to_thread(
@@ -41,6 +43,25 @@ class Moderacion(commands.Cog):
             return await ctx.send("❌ No hay registro activo aquí.")
 
         registro = result.data[0]
+
+        participantes_registrados = []
+        if asistencia:
+            ids_validos = [uid for uid in registro['participantes'].values() if uid is not None]
+            for uid in ids_validos:
+                m = ctx.guild.get_member(int(uid))
+                if m and not m.bot:
+                    participantes_registrados.append(m)
+
+            if participantes_registrados:
+                asistencias_data = [{
+                    'registro_actividad_id': registro['registro_actividad_id'],
+                    'usuario_id': str(p.id),
+                    'usuario_nombre': p.display_name
+                } for p in participantes_registrados]
+                await asyncio.to_thread(
+                    lambda: get_db().table('asistencias').insert(asistencias_data).execute()
+                )
+
         pings_cog = self.bot.get_cog("PingsAlbion")
         if pings_cog:
             await pings_cog.actualizar_mensaje(ctx.channel, registro, estado="cancelada", motivo=motivo)
@@ -51,7 +72,19 @@ class Moderacion(commands.Cog):
                 .eq('hilo_id', hilo_id)
                 .execute()
         )
-        await ctx.send(f"🚫 Actividad cancelada: **{motivo}**.")
+
+        embed = discord.Embed(title="🚫 Actividad Cancelada", color=discord.Color.dark_red())
+        embed.add_field(name="Motivo", value=motivo, inline=False)
+        if asistencia and participantes_registrados:
+            lista = " ".join(p.mention for p in participantes_registrados)
+            embed.add_field(
+                name=f"✅ Asistencia registrada ({len(participantes_registrados)})",
+                value=lista,
+                inline=False
+            )
+        elif asistencia:
+            embed.add_field(name="⚠️ Asistencia", value="No había miembros anotados.", inline=False)
+        await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="kick_gremio", description="Remueve todos los roles de un miembro y lo expulsa del Discord")
     @app_commands.describe(usuario="El miembro a expulsar", motivo="Razón de la expulsión")

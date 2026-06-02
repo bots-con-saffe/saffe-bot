@@ -74,6 +74,7 @@ class CrearCanales(commands.Cog):
                         .execute()
                 )
                 await nuevo.set_permissions(member, manage_channels=True, manage_permissions=True, connect=True)
+                await self._set_staff_perms(nuevo, member.guild)
                 await member.move_to(nuevo)
             except: pass
 
@@ -106,6 +107,7 @@ class CrearCanales(commands.Cog):
                             .execute()
                     )
                     await before.channel.set_permissions(nuevo_dueno, manage_channels=True, manage_permissions=True)
+                    await self._set_staff_perms(before.channel, before.channel.guild)
                     try:
                         prefijo = "🔊"
                         for cat, config in self.config_categorias.items():
@@ -114,6 +116,19 @@ class CrearCanales(commands.Cog):
                                 break
                         await before.channel.edit(name=f"{prefijo} de {nuevo_dueno.display_name}")
                     except: pass
+
+    async def _set_staff_perms(self, canal: discord.VoiceChannel, guild: discord.Guild):
+        for nombre_rol in ("Oficial", "Guild Master"):
+            rol = discord.utils.get(guild.roles, name=nombre_rol)
+            if rol:
+                await canal.set_permissions(
+                    rol,
+                    manage_channels=True,
+                    manage_permissions=True,
+                    mute_members=True,
+                    use_soundboard=True,
+                    connect=True,
+                )
 
     async def validar_sala(self, ctx):
         if not ctx.author.voice or not ctx.author.voice.channel:
