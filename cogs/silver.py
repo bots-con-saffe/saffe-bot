@@ -34,7 +34,7 @@ class Silver(commands.Cog):
         self.bot = bot
 
     def formatear(self, cantidad: int) -> str:
-        return f"{cantidad:,}".replace(",", ".")
+        return f"{cantidad:,}"
 
     def convertir_unidad(self, entrada: str) -> int:
         """Convierte '20m', '500k', '1.5m' a entero."""
@@ -102,7 +102,7 @@ class Silver(commands.Cog):
             saldo = row.get('balance', 0)
             if saldo > 0:
                 deuda_total += saldo
-                detalles.append((row.get('usuario_nombre', 'Desconocido'), saldo))
+                detalles.append((row.get('usuario_id', ''), row.get('usuario_nombre', 'Desconocido'), saldo))
 
         if deuda_total == 0:
             return await ctx.send(embed=discord.Embed(
@@ -111,12 +111,26 @@ class Silver(commands.Cog):
                 color=discord.Color.green()
             ))
 
-        detalles.sort(key=lambda x: -x[1])
-        lineas = [f"• **{nombre}**: {self.formatear(saldo)} silver" for nombre, saldo in detalles]
+        detalles.sort(key=lambda x: -x[2])
+
+        lineas = []
+        for uid, nombre, saldo in detalles:
+            try:
+                en_server = ctx.guild.get_member(int(uid)) is not None
+            except (ValueError, TypeError):
+                en_server = False
+            if en_server:
+                lineas.append(f"✅ **{nombre}**: {self.formatear(saldo)} silver")
+            else:
+                lineas.append(f"❌ `{nombre}`: {self.formatear(saldo)} silver")
 
         embed = discord.Embed(
             title="📊 Reporte de Deuda Pendiente del Gremio",
-            description=f"💰 **Total a Pagar:** {self.formatear(deuda_total)} silver\n👥 **Jugadores con saldo:** {len(detalles)}",
+            description=(
+                f"💰 **Total a Pagar:** {self.formatear(deuda_total)} silver\n"
+                f"👥 **Jugadores con saldo:** {len(detalles)}\n"
+                f"✅ En servidor  •  ❌ Salió del DC *(copia el nombre para `/expropiar`)*"
+            ),
             color=discord.Color.red()
         )
 
@@ -129,7 +143,7 @@ class Silver(commands.Cog):
         if chunk:
             embed.add_field(name=f"📋 Desglose ({num})", value=chunk.strip(), inline=False)
 
-        embed.set_footer(text="Usa /pay [usuario] para saldar la cuenta de alguien.")
+        embed.set_footer(text="Usa /pay para saldar • /expropiar <nombre> para quien salió del DC")
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="historial", description="Muestra las últimas transacciones de silver")
@@ -404,21 +418,65 @@ class Silver(commands.Cog):
         await _actualizar_balance(usuario, -valor, "ajuste_manual", motivo)
         await ctx.send(f"✅ Restados **{self.formatear(valor)}** silver a {usuario.mention}. Motivo: *{motivo}*")
 
-    @commands.hybrid_command(name="expropiar", description="Quita TODO el balance de un miembro")
-    @app_commands.describe(usuario="El miembro", motivo="Razón de la expropiación")
+    @commands.hybrid_command(name="expropiar", description="Quita TODO el balance de un miembro (funciona aunque haya salido del servidor)")
+    @app_commands.describe(usuario="Nombre del miembro o mención", motivo="Razón de la expropiación")
     @commands.has_any_role("Oficial", "Guild Master")
-    async def expropiar(self, ctx, usuario: discord.Member, *, motivo: str):
-        result = await asyncio.to_thread(
-            lambda: get_db().table('balances').select('balance').eq('usuario_id', str(usuario.id)).execute()
-        )
-        saldo = result.data[0]['balance'] if result.data else 0
+    async def expropiar(self, ctx, usuario: str, *, motivo: str):
+        # Intentar resolver como Member (mención o ID numérico)
+        target_id     = None
+        target_nombre = None
+        saldo         = 0
+
+        uid_str = usuario.strip('<@!> ')
+        if uid_str.isdigit():
+            member = ctx.guild.get_member(int(uid_str))
+            if member:
+                target_id     = str(member.id)
+                target_nombre = member.display_name
+
+        if target_id:
+            result = await asyncio.to_thread(
+                lambda: get_db().table('balances').select('balance').eq('usuario_id', target_id).execute()
+            )
+            saldo = result.data[0]['balance'] if result.data else 0
+        else:
+            # Buscar por nombre en la tabla balances
+            result = await asyncio.to_thread(
+                lambda: get_db().table('balances').select('usuario_id, usuario_nombre, balance')
+                    .ilike('usuario_nombre', f'%{usuario}%')
+                    .neq('usuario_id', 'BANCO_GREMIO').execute()
+            )
+            if not result.data:
+                return await ctx.send(f"❌ No se encontró ningún usuario con el nombre **{usuario}** en la base de datos.", delete_after=8)
+            if len(result.data) > 1:
+                lineas = [f"• **{r['usuario_nombre']}** — {self.formatear(r['balance'])} silver" for r in result.data[:10]]
+                return await ctx.send(embed=discord.Embed(
+                    title="⚠️ Múltiples coincidencias — sé más específico",
+                    description="\n".join(lineas),
+                    color=discord.Color.orange()
+                ))
+            row           = result.data[0]
+            target_id     = row['usuario_id']
+            target_nombre = row['usuario_nombre']
+            saldo         = row['balance']
+
         if saldo <= 0:
-            return await ctx.send(f"❌ {usuario.display_name} no tiene silver para expropiar.", delete_after=5)
-        await _actualizar_balance(usuario, -saldo, "expropiacion", motivo)
+            return await ctx.send(f"❌ **{target_nombre}** no tiene silver para expropiar.", delete_after=5)
+
+        async with get_balance_lock(target_id):
+            await asyncio.to_thread(
+                lambda: get_db().table('balances').update({'balance': 0}).eq('usuario_id', target_id).execute()
+            )
+            await asyncio.to_thread(
+                lambda: get_db().table('transacciones').insert({
+                    'usuario_id': target_id, 'tipo': 'expropiacion', 'cantidad': -saldo, 'motivo': motivo
+                }).execute()
+            )
+
         embed = discord.Embed(title="⚖️ Expropiación Total", color=discord.Color.dark_red())
-        embed.add_field(name="Miembro",   value=usuario.mention,                          inline=True)
-        embed.add_field(name="Cantidad",  value=f"**{self.formatear(saldo)}** silver",    inline=True)
-        embed.add_field(name="Motivo",    value=motivo,                                   inline=False)
+        embed.add_field(name="Miembro",  value=target_nombre,                         inline=True)
+        embed.add_field(name="Cantidad", value=f"**{self.formatear(saldo)}** silver", inline=True)
+        embed.add_field(name="Motivo",   value=motivo,                                inline=False)
         embed.set_footer(text=f"Ejecutado por {ctx.author.display_name}")
         await ctx.send(embed=embed)
 
