@@ -277,6 +277,70 @@ class Silver(commands.Cog):
         await ctx.send(embed=embed)
         await ctx.channel.edit(locked=True, archived=True)
 
+    @commands.hybrid_command(name="progremio", description="Registra asistencia de la actividad sin repartir silver y cierra el hilo")
+    @app_commands.describe(excluir="Miembro a excluir del registro")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def progremio(self, ctx, excluir: discord.Member = None):
+        if not isinstance(ctx.channel, discord.Thread):
+            return await ctx.send("❌ Usa esto en un hilo activo.", delete_after=5)
+        await ctx.defer()
+
+        hilo_id = str(ctx.channel.id)
+        result = await asyncio.to_thread(
+            lambda: get_db().table('registros_activos').select('*').eq('hilo_id', hilo_id).execute()
+        )
+        if not result.data:
+            return await ctx.send("❌ No hay una actividad activa registrada en este hilo.")
+
+        registro = result.data[0]
+        ids_validos = [uid for uid in registro['participantes'].values() if uid is not None]
+
+        participantes = []
+        for uid in ids_validos:
+            if excluir and str(excluir.id) == uid:
+                continue
+            m = ctx.guild.get_member(int(uid))
+            if m and not m.bot:
+                participantes.append(m)
+
+        if not participantes:
+            return await ctx.send("❌ No hay miembros anotados en esta actividad.")
+
+        # Marcar la actividad como doble asistencia
+        await asyncio.to_thread(
+            lambda: get_db().table('registros_actividad')
+                .update({'multiplicador': 2})
+                .eq('id', registro['registro_actividad_id'])
+                .execute()
+        )
+
+        asistencias_data = [{
+            'registro_actividad_id': registro['registro_actividad_id'],
+            'usuario_id': str(p.id),
+            'usuario_nombre': p.display_name
+        } for p in participantes]
+        await asyncio.to_thread(
+            lambda: get_db().table('asistencias').insert(asistencias_data).execute()
+        )
+
+        pings_cog = self.bot.get_cog("PingsAlbion")
+        if pings_cog:
+            await pings_cog.actualizar_mensaje(ctx.channel, registro, estado="finalizada")
+
+        await asyncio.to_thread(
+            lambda: get_db().table('registros_activos').delete().eq('hilo_id', hilo_id).execute()
+        )
+
+        lista = "\n".join(p.mention for p in participantes)
+        embed = discord.Embed(
+            title="🛡️ Pro Gremio — Asistencia Registrada",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name=f"👥 Participantes ({len(participantes)})", value=lista, inline=False)
+        embed.set_footer(text="✨ Doble asistencia aplicada. Sin reparto de silver. Hilo archivado.")
+        await ctx.send(embed=embed)
+        await ctx.channel.edit(locked=True, archived=True)
+
     @commands.hybrid_command(name="split_medio", description="Reparte silver y registra asistencia SIN cerrar la actividad")
     @app_commands.describe(
         bolsas="Silver en bolsas (Ej: 20m, 500k)",

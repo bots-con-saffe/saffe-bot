@@ -241,6 +241,62 @@ class Asistencias(commands.Cog):
             )
             await ctx.send(embed=embed)
 
+    @commands.hybrid_command(name="ultima_asistencia_gremio", description="Muestra cuándo fue la última asistencia de cada miembro del gremio")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def ultima_asistencia_gremio(self, ctx):
+        await ctx.defer()
+
+        result = await asyncio.to_thread(
+            lambda: get_db().table('asistencias')
+                .select('usuario_id, fecha')
+                .order('fecha', desc=True)
+                .execute()
+        )
+
+        # Última asistencia por usuario
+        ultima: dict[str, str] = {}
+        for row in result.data:
+            uid = row['usuario_id']
+            if uid not in ultima:
+                ultima[uid] = row['fecha']
+
+        roles_gremio = ["Miembro", "Ava Core", "PvE Content", "PvP Content", "Oficial", "Guild Master"]
+        miembros = [m for m in ctx.guild.members if not m.bot and any(discord.utils.get(m.roles, name=r) for r in roles_gremio)]
+
+        con_asistencia = [(m, ultima[str(m.id)]) for m in miembros if str(m.id) in ultima]
+        sin_asistencia = [m for m in miembros if str(m.id) not in ultima]
+
+        con_asistencia.sort(key=lambda x: x[1], reverse=True)
+        sin_asistencia.sort(key=lambda x: x.display_name)
+
+        lineas = []
+        for m, fecha_str in con_asistencia:
+            try:
+                dt = datetime.fromisoformat(fecha_str.replace('Z', '+00:00'))
+                unix_ts = int(dt.timestamp())
+                lineas.append(f"• **{m.display_name}** — <t:{unix_ts}:R>")
+            except Exception:
+                lineas.append(f"• **{m.display_name}** — {fecha_str[:10]}")
+        for m in sin_asistencia:
+            lineas.append(f"• **{m.display_name}** — ❌ Sin asistencias")
+
+        embed = discord.Embed(
+            title="🕐 Última Asistencia del Gremio",
+            description=f"**{len(miembros)}** miembros  •  **{len(con_asistencia)}** con registro  •  **{len(sin_asistencia)}** sin registro",
+            color=discord.Color.blurple()
+        )
+
+        chunk, num = "", 1
+        for linea in lineas:
+            if len(chunk) + len(linea) + 1 > 1000:
+                embed.add_field(name=f"​" if num > 1 else "Miembros", value=chunk.strip(), inline=False)
+                chunk, num = "", num + 1
+            chunk += linea + "\n"
+        if chunk:
+            embed.add_field(name="​" if num > 1 else "Miembros", value=chunk.strip(), inline=False)
+
+        await ctx.send(embed=embed)
+
     @commands.hybrid_command(name="sorteo", description="Ganador aleatorio ponderado por tickets de asistencia")
     @commands.has_any_role("Oficial", "Guild Master")
     async def sorteo(self, ctx):
