@@ -101,16 +101,23 @@ class Silver(commands.Cog):
             ))
 
         detalles.sort(key=lambda x: -x[1])
-        lineas = [f"• **{nombre}**: {self.formatear(saldo)} silver" for nombre, saldo in detalles[:30]]
-        if len(detalles) > 30:
-            lineas.append(f"*... y {len(detalles) - 30} usuarios más.*")
+        lineas = [f"• **{nombre}**: {self.formatear(saldo)} silver" for nombre, saldo in detalles]
 
         embed = discord.Embed(
             title="📊 Reporte de Deuda Pendiente del Gremio",
             description=f"💰 **Total a Pagar:** {self.formatear(deuda_total)} silver\n👥 **Jugadores con saldo:** {len(detalles)}",
             color=discord.Color.red()
         )
-        embed.add_field(name="📋 Desglose de Cuentas Pendientes", value="\n".join(lineas), inline=False)
+
+        chunk, num = "", 1
+        for linea in lineas:
+            if len(chunk) + len(linea) + 1 > 1000:
+                embed.add_field(name=f"📋 Desglose ({num})", value=chunk.strip(), inline=False)
+                chunk, num = "", num + 1
+            chunk += linea + "\n"
+        if chunk:
+            embed.add_field(name=f"📋 Desglose ({num})", value=chunk.strip(), inline=False)
+
         embed.set_footer(text="Usa /pay [usuario] para saldar la cuenta de alguien.")
         await ctx.send(embed=embed)
 
