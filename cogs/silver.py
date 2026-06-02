@@ -64,15 +64,26 @@ class Silver(commands.Cog):
         else:
             target = ctx.author
 
-        result = await asyncio.to_thread(
-            lambda: get_db().table('balances').select('balance').eq('usuario_id', str(target.id)).execute()
+        result, multas_result = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: get_db().table('balances').select('balance').eq('usuario_id', str(target.id)).execute()
+            ),
+            asyncio.to_thread(
+                lambda: get_db().table('multas').select('cantidad').eq('usuario_id', str(target.id)).eq('pagada', False).execute()
+            )
         )
-        saldo = result.data[0]['balance'] if result.data else 0
-        await ctx.send(embed=discord.Embed(
-            title=f"💰 Balance de {target.display_name}",
-            description=f"**{self.formatear(saldo)}** silver",
-            color=discord.Color.gold()
-        ))
+        saldo        = result.data[0]['balance'] if result.data else 0
+        total_multas = sum(m['cantidad'] for m in multas_result.data) if multas_result.data else 0
+        balance_real = saldo - total_multas
+
+        embed = discord.Embed(title=f"💰 Balance de {target.display_name}", color=discord.Color.gold())
+        if total_multas > 0:
+            embed.add_field(name="💰 Balance Bruto",        value=f"**{self.formatear(saldo)}** silver",         inline=True)
+            embed.add_field(name="⚠️ Multas Pendientes",   value=f"**-{self.formatear(total_multas)}** silver",  inline=True)
+            embed.add_field(name="📊 Balance Real",         value=f"**{self.formatear(balance_real)}** silver",   inline=True)
+        else:
+            embed.description = f"**{self.formatear(saldo)}** silver"
+        await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="balance_total_gremio", description="Suma total de silver que el gremio debe pagar a los miembros")
     @commands.has_any_role("Oficial", "Guild Master")
@@ -345,12 +356,27 @@ class Silver(commands.Cog):
     @commands.hybrid_command(name="pay", description="Salda la deuda pendiente de un miembro")
     @commands.has_any_role("Oficial", "Guild Master")
     async def pay(self, ctx, usuario: discord.Member):
-        result = await asyncio.to_thread(
-            lambda: get_db().table('balances').select('balance').eq('usuario_id', str(usuario.id)).execute()
+        balance_result, multas_result = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: get_db().table('balances').select('balance').eq('usuario_id', str(usuario.id)).execute()
+            ),
+            asyncio.to_thread(
+                lambda: get_db().table('multas').select('id, cantidad, motivo').eq('usuario_id', str(usuario.id)).eq('pagada', False).execute()
+            )
         )
-        if not result.data or result.data[0]['balance'] <= 0:
+        if not balance_result.data or balance_result.data[0]['balance'] <= 0:
             return await ctx.send("❌ Este miembro no tiene balance pendiente.")
-        deuda = result.data[0]['balance']
+        if multas_result.data:
+            total_multas = sum(m['cantidad'] for m in multas_result.data)
+            lineas = [f"• `#{m['id']}` {self.formatear(m['cantidad'])} silver — {m['motivo']}" for m in multas_result.data]
+            embed = discord.Embed(
+                title="⛔ Pago bloqueado — Multas pendientes",
+                description=f"{usuario.mention} tiene **{len(multas_result.data)} multa(s)** por un total de **{self.formatear(total_multas)} silver**.\nResuélvelas antes de pagar el balance.\n\n" + "\n".join(lineas),
+                color=discord.Color.red()
+            )
+            embed.set_footer(text="Usa /quitar_multa <id> para cancelar una multa")
+            return await ctx.send(embed=embed)
+        deuda = balance_result.data[0]['balance']
         await _actualizar_balance(usuario, -deuda, "pago", "Pago total de deuda")
         await ctx.send(f"✅ Pagados **{self.formatear(deuda)}** silver a {usuario.mention}.")
 
@@ -373,14 +399,124 @@ class Silver(commands.Cog):
     @commands.hybrid_command(name="removebalance", description="Resta silver del balance de un miembro manualmente")
     @app_commands.describe(usuario="El miembro", cantidad="Cantidad a restar (Ej: 500k, 1m)", motivo="Razón del ajuste")
     @commands.has_any_role("Oficial", "Guild Master")
-    async def removebalance(self, ctx, usuario: discord.Member, cantidad: str, *, motivo: str = "Ajuste manual"):
+    async def removebalance(self, ctx, usuario: discord.Member, cantidad: str, *, motivo: str):
         valor = self.convertir_unidad(cantidad)
         await _actualizar_balance(usuario, -valor, "ajuste_manual", motivo)
-        await ctx.send(f"✅ Restados **{self.formatear(valor)}** silver a {usuario.mention}.")
+        await ctx.send(f"✅ Restados **{self.formatear(valor)}** silver a {usuario.mention}. Motivo: *{motivo}*")
+
+    @commands.hybrid_command(name="expropiar", description="Quita TODO el balance de un miembro")
+    @app_commands.describe(usuario="El miembro", motivo="Razón de la expropiación")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def expropiar(self, ctx, usuario: discord.Member, *, motivo: str):
+        result = await asyncio.to_thread(
+            lambda: get_db().table('balances').select('balance').eq('usuario_id', str(usuario.id)).execute()
+        )
+        saldo = result.data[0]['balance'] if result.data else 0
+        if saldo <= 0:
+            return await ctx.send(f"❌ {usuario.display_name} no tiene silver para expropiar.", delete_after=5)
+        await _actualizar_balance(usuario, -saldo, "expropiacion", motivo)
+        embed = discord.Embed(title="⚖️ Expropiación Total", color=discord.Color.dark_red())
+        embed.add_field(name="Miembro",   value=usuario.mention,                          inline=True)
+        embed.add_field(name="Cantidad",  value=f"**{self.formatear(saldo)}** silver",    inline=True)
+        embed.add_field(name="Motivo",    value=motivo,                                   inline=False)
+        embed.set_footer(text=f"Ejecutado por {ctx.author.display_name}")
+        await ctx.send(embed=embed)
+
+    # --- MULTAS ---
+
+    @commands.hybrid_command(name="multa", description="Aplica una multa pendiente a un miembro")
+    @app_commands.describe(usuario="El miembro", cantidad="Cantidad de la multa (Ej: 500k, 1m)", motivo="Razón de la multa")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def multa(self, ctx, usuario: discord.Member, cantidad: str, *, motivo: str):
+        valor = self.convertir_unidad(cantidad)
+        if valor <= 0:
+            return await ctx.send("❌ Cantidad inválida.", delete_after=5)
+        await asyncio.to_thread(
+            lambda: get_db().table('multas').insert({
+                'usuario_id':     str(usuario.id),
+                'usuario_nombre': usuario.display_name,
+                'cantidad':       valor,
+                'motivo':         motivo
+            }).execute()
+        )
+        embed = discord.Embed(title="⚠️ Multa Registrada", color=discord.Color.orange())
+        embed.add_field(name="Miembro",  value=usuario.mention,                        inline=True)
+        embed.add_field(name="Cantidad", value=f"**{self.formatear(valor)}** silver",  inline=True)
+        embed.add_field(name="Motivo",   value=motivo,                                 inline=False)
+        embed.set_footer(text=f"Aplicada por {ctx.author.display_name} • Usa /ver_multas para ver el detalle")
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="ver_multas", description="Muestra las multas pendientes de un miembro")
+    @app_commands.describe(usuario="Miembro a consultar (solo Oficial/GM para ver el de otro)")
+    async def ver_multas(self, ctx, usuario: discord.Member = None):
+        await ctx.defer(ephemeral=True)
+        if usuario and usuario != ctx.author:
+            if not any(r.name in ["Oficial", "Guild Master"] for r in ctx.author.roles):
+                return await ctx.send("❌ Solo Oficiales y Guild Masters pueden ver las multas de otros.", delete_after=5)
+            target = usuario
+        else:
+            target = ctx.author
+
+        result = await asyncio.to_thread(
+            lambda: get_db().table('multas').select('id, cantidad, motivo, fecha')
+                .eq('usuario_id', str(target.id)).eq('pagada', False)
+                .order('fecha', desc=False).execute()
+        )
+        if not result.data:
+            return await ctx.send(embed=discord.Embed(
+                title=f"✅ Sin multas — {target.display_name}",
+                description="No tiene multas pendientes.",
+                color=discord.Color.green()
+            ))
+
+        total = sum(m['cantidad'] for m in result.data)
+        lineas = [
+            f"`#{m['id']}` **{self.formatear(m['cantidad'])}** silver — {m['motivo']} *(_{m['fecha'][:10]}_)*"
+            for m in result.data
+        ]
+        embed = discord.Embed(
+            title=f"⚠️ Multas de {target.display_name}",
+            description="\n".join(lineas),
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text=f"Total pendiente: {self.formatear(total)} silver • Usa /quitar_multa <id> para cancelar una")
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="quitar_multa", description="Cancela una multa por su ID")
+    @app_commands.describe(multa_id="ID de la multa (visible en /ver_multas)")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def quitar_multa(self, ctx, multa_id: int):
+        result = await asyncio.to_thread(
+            lambda: get_db().table('multas').select('id, usuario_nombre, cantidad, motivo')
+                .eq('id', multa_id).eq('pagada', False).execute()
+        )
+        if not result.data:
+            return await ctx.send(f"❌ No existe una multa pendiente con ID `{multa_id}`.", delete_after=5)
+        m = result.data[0]
+        await asyncio.to_thread(
+            lambda: get_db().table('multas').update({'pagada': True}).eq('id', multa_id).execute()
+        )
+        await ctx.send(
+            f"✅ Multa `#{multa_id}` cancelada — **{m['usuario_nombre']}** | "
+            f"{self.formatear(m['cantidad'])} silver | *{m['motivo']}*"
+        )
 
     @commands.hybrid_command(name="remove_balance", description="Resetea el balance de un miembro a cero sin registrar transacción")
     @commands.has_any_role("Oficial", "Guild Master")
     async def remove_balance(self, ctx, usuario: discord.Member):
+        multas_result = await asyncio.to_thread(
+            lambda: get_db().table('multas').select('id, cantidad, motivo').eq('usuario_id', str(usuario.id)).eq('pagada', False).execute()
+        )
+        if multas_result.data:
+            total_multas = sum(m['cantidad'] for m in multas_result.data)
+            lineas = [f"• `#{m['id']}` {self.formatear(m['cantidad'])} silver — {m['motivo']}" for m in multas_result.data]
+            embed = discord.Embed(
+                title="⛔ Operación bloqueada — Multas pendientes",
+                description=f"{usuario.mention} tiene **{len(multas_result.data)} multa(s)** por un total de **{self.formatear(total_multas)} silver**.\nResuélvelas antes de limpiar el balance.\n\n" + "\n".join(lineas),
+                color=discord.Color.red()
+            )
+            embed.set_footer(text="Usa /quitar_multa <id> para cancelar una multa")
+            return await ctx.send(embed=embed)
         await asyncio.to_thread(
             lambda: get_db().table('balances')
                 .update({'balance': 0})
