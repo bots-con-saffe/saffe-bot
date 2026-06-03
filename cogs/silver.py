@@ -604,6 +604,118 @@ class Silver(commands.Cog):
         embed.set_footer(text=f"Total pendiente: {self.formatear(total)} silver • Usa /quitar_multa <id> para cancelar una")
         await ctx.send(embed=embed)
 
+    @commands.hybrid_command(name="saldar_multa", description="Paga una multa específica descontándola del balance del miembro")
+    @app_commands.describe(usuario="El miembro")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def saldar_multa(self, ctx, usuario: discord.Member):
+        await ctx.defer(ephemeral=True)
+
+        balance_result, multas_result = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: get_db().table('balances').select('balance')
+                    .eq('usuario_id', str(usuario.id)).execute()
+            ),
+            asyncio.to_thread(
+                lambda: get_db().table('multas').select('id, cantidad, motivo')
+                    .eq('usuario_id', str(usuario.id)).eq('pagada', False)
+                    .order('fecha').execute()
+            )
+        )
+        saldo = balance_result.data[0]['balance'] if balance_result.data else 0
+        multas = multas_result.data
+
+        if not multas:
+            return await ctx.send(f"✅ **{usuario.display_name}** no tiene multas pendientes.")
+
+        view = SaldarMultaView(self, usuario, multas, saldo)
+        await ctx.send(embed=self._embed_multas_saldo(usuario, multas, saldo), view=view)
+
+    @commands.hybrid_command(name="saldar_todas_multas", description="Usa el balance del miembro para pagar todas sus multas (hasta donde alcance)")
+    @app_commands.describe(usuario="El miembro")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def saldar_todas_multas(self, ctx, usuario: discord.Member):
+        await ctx.defer()
+
+        balance_result, multas_result = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: get_db().table('balances').select('balance')
+                    .eq('usuario_id', str(usuario.id)).execute()
+            ),
+            asyncio.to_thread(
+                lambda: get_db().table('multas').select('id, cantidad, motivo')
+                    .eq('usuario_id', str(usuario.id)).eq('pagada', False)
+                    .order('fecha').execute()
+            )
+        )
+        saldo = balance_result.data[0]['balance'] if balance_result.data else 0
+        multas = multas_result.data
+
+        if not multas:
+            return await ctx.send(f"✅ **{usuario.display_name}** no tiene multas pendientes.")
+        if saldo <= 0:
+            return await ctx.send(f"❌ **{usuario.display_name}** no tiene balance para saldar multas.")
+
+        pagadas, no_pagadas, balance_usado, saldo_restante = [], [], 0, saldo
+        for multa in multas:
+            if saldo_restante >= multa['cantidad']:
+                pagadas.append(multa)
+                saldo_restante -= multa['cantidad']
+                balance_usado += multa['cantidad']
+            else:
+                no_pagadas.append(multa)
+
+        if not pagadas:
+            return await ctx.send(
+                f"❌ El balance de **{usuario.display_name}** (**{self.formatear(saldo)}** silver) "
+                f"no alcanza ni para la multa más pequeña (**{self.formatear(multas[0]['cantidad'])}** silver)."
+            )
+
+        ids_pagadas = [m['id'] for m in pagadas]
+        await asyncio.to_thread(
+            lambda: get_db().table('multas').update({'pagada': True})
+                .in_('id', ids_pagadas).execute()
+        )
+        await _actualizar_balance(usuario, -balance_usado, "pago_multas", f"Saldo de {len(pagadas)} multa(s)")
+
+        embed = discord.Embed(
+            title=f"⚖️ Multas saldadas — {usuario.display_name}",
+            color=discord.Color.green() if not no_pagadas else discord.Color.orange()
+        )
+        embed.add_field(
+            name=f"✅ Pagadas ({len(pagadas)})",
+            value="\n".join(f"**{self.formatear(m['cantidad'])}** silver — {m['motivo']}" for m in pagadas),
+            inline=False
+        )
+        if no_pagadas:
+            embed.add_field(
+                name=f"❌ Sin fondos suficientes ({len(no_pagadas)})",
+                value="\n".join(f"**{self.formatear(m['cantidad'])}** silver — {m['motivo']}" for m in no_pagadas),
+                inline=False
+            )
+        embed.add_field(
+            name="Resumen",
+            value=f"Silver usado: **{self.formatear(balance_usado)}**\nBalance restante: **{self.formatear(saldo_restante)}** silver",
+            inline=False
+        )
+        embed.set_footer(text=f"Ejecutado por {ctx.author.display_name}")
+        await ctx.send(embed=embed)
+
+    def _embed_multas_saldo(self, usuario: discord.Member, multas: list, saldo: int) -> discord.Embed:
+        total = sum(m['cantidad'] for m in multas)
+        lineas = []
+        for m in multas:
+            icono = "✅" if saldo >= m['cantidad'] else "❌"
+            lineas.append(f"{icono} **{self.formatear(m['cantidad'])}** silver — {m['motivo']}")
+        embed = discord.Embed(
+            title=f"⚠️ Multas de {usuario.display_name}",
+            description="\n".join(lineas),
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Balance disponible", value=f"**{self.formatear(saldo)}** silver", inline=True)
+        embed.add_field(name="Total multas",        value=f"**{self.formatear(total)}** silver", inline=True)
+        embed.set_footer(text="✅ balance suficiente  •  ❌ sin fondos  •  Selecciona con el menú")
+        return embed
+
     @commands.hybrid_command(name="quitar_multa", description="Cancela una multa por su ID")
     @app_commands.describe(multa_id="ID de la multa (visible en /ver_multas)")
     @commands.has_any_role("Oficial", "Guild Master")
@@ -672,6 +784,70 @@ class Silver(commands.Cog):
             description="Se han eliminado todos los registros de asistencia del servidor.",
             color=discord.Color.red()
         ))
+
+class SaldarMultaView(discord.ui.View):
+    def __init__(self, cog, usuario: discord.Member, multas: list, saldo: int):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.usuario = usuario
+        self.multas = multas
+        self.saldo = saldo
+
+        options = []
+        for m in multas[:25]:
+            puede = saldo >= m['cantidad']
+            options.append(discord.SelectOption(
+                label=f"{cog.formatear(m['cantidad'])} silver",
+                description=(m['motivo'] or "Sin motivo")[:100],
+                value=str(m['id']),
+                emoji="✅" if puede else "❌"
+            ))
+
+        select = discord.ui.Select(placeholder="Elige la multa a pagar...", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+        self._select = select
+
+    async def _on_select(self, interaction: discord.Interaction):
+        multa_id = int(self._select.values[0])
+        multa = next((m for m in self.multas if m['id'] == multa_id), None)
+        if not multa:
+            return await interaction.response.send_message("❌ Multa no encontrada.", ephemeral=True)
+
+        if self.saldo < multa['cantidad']:
+            return await interaction.response.send_message(
+                f"❌ Balance insuficiente: tiene **{self.cog.formatear(self.saldo)}** silver "
+                f"pero la multa es de **{self.cog.formatear(multa['cantidad'])}** silver.",
+                ephemeral=True
+            )
+
+        await asyncio.to_thread(
+            lambda: get_db().table('multas').update({'pagada': True}).eq('id', multa_id).execute()
+        )
+        await _actualizar_balance(self.usuario, -multa['cantidad'], "pago_multa", f"Multa: {multa['motivo']}")
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ Multa saldada",
+                description=(
+                    f"Se descontaron **{self.cog.formatear(multa['cantidad'])}** silver "
+                    f"del balance de {self.usuario.mention}.\n"
+                    f"Motivo: *{multa['motivo']}*\n"
+                    f"Balance restante: **{self.cog.formatear(self.saldo - multa['cantidad'])}** silver"
+                ),
+                color=discord.Color.green()
+            ),
+            view=self
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
 
 async def setup(bot):
     await bot.add_cog(Silver(bot))

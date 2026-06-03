@@ -1,37 +1,44 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 import random
+import datetime
 from db import get_db, get_balance_lock
 from cogs.silver import _actualizar_balance
 
-BANCO_ID   = "BANCO_GREMIO"
-MAX_APUESTA = 500_000
+BANCO_ID = "BANCO_GREMIO"
+MAX_APUESTA = 300_000
+LIMITE_PERDEDOR_DIA = 3_000_000
+LIMITE_APUESTA_PERDEDOR = 1_000_000
+NUM_MAZOS = 6
+ZAPATO_MINIMO = int(52 * 2.5)   # < 2.5 mazos → reshuffle
+RACHA_MAX_GANA = 3
+ROL_PERDEDOR = "Donador Certificado"
+CANAL_VERGUENZA = "🎲┃leyendas-de-la-perdida"
 
-# ── Dados ────────────────────────────────────────────────────────────────────
 DADO_EMO = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
-
-# ── Blackjack ────────────────────────────────────────────────────────────────
-PALOS   = ["♠", "♥", "♦", "♣"]
+PALOS = ["♠", "♥", "♦", "♣"]
 VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 
-def nueva_baraja() -> list[str]:
-    return [f"{v}{p}" for p in PALOS for v in VALORES]
 
 def valor_carta(carta: str) -> int:
     v = carta[:-1]
-    if v in ("J", "Q", "K"): return 10
-    if v == "A":              return 11
+    if v in ("J", "Q", "K"):
+        return 10
+    if v == "A":
+        return 11
     return int(v)
+
 
 def calcular_mano(mano: list[str]) -> int:
     total = sum(valor_carta(c) for c in mano)
-    ases  = sum(1 for c in mano if c[:-1] == "A")
+    ases = sum(1 for c in mano if c[:-1] == "A")
     while total > 21 and ases:
         total -= 10
-        ases  -= 1
+        ases -= 1
     return total
+
 
 def render_mano(mano: list[str], ocultar_segunda: bool = False) -> str:
     if ocultar_segunda:
@@ -43,11 +50,174 @@ def render_mano(mano: list[str], ocultar_segunda: bool = False) -> str:
 
 class Casino(commands.Cog):
     def __init__(self, bot):
-        self.bot          = bot
-        self.jugando      = set()   # user IDs con juego activo
+        self.bot = bot
+        self.jugando = set()
         self.ruleta_activa = False
 
-    # ── utilidades ────────────────────────────────────────────────────────────
+        # Zapato compartido (6 mazos)
+        self.zapato: list[str] = []
+        self.shuffle_pendiente: bool = False
+        self.bj_racha_gana: dict[str, int] = {}
+        self._inicializar_zapato()
+
+        # Seguimiento diario de casino
+        self.casino_hoy: dict[str, dict] = {}  # uid -> {fecha, perdidas, apostado}
+
+        # Expiración del rol de perdedor
+        self.perdedor_expiry: dict[str, datetime.datetime] = {}
+
+        self._check_roles_task.start()
+
+    def cog_unload(self):
+        self._check_roles_task.cancel()
+
+    # ── Background task: quitar rol de perdedor al expirar ────────────────────
+
+    @tasks.loop(minutes=30)
+    async def _check_roles_task(self):
+        ahora = datetime.datetime.now(datetime.timezone.utc)
+        expirados = [uid for uid, exp in self.perdedor_expiry.items() if ahora >= exp]
+        for uid in expirados:
+            del self.perdedor_expiry[uid]
+            await asyncio.to_thread(
+                lambda u=uid: get_db().table("rol_expiraciones").delete()
+                    .eq("usuario_id", u).execute()
+            )
+            for guild in self.bot.guilds:
+                member = guild.get_member(int(uid))
+                if not member:
+                    continue
+                rol = discord.utils.get(guild.roles, name=ROL_PERDEDOR)
+                if rol and rol in member.roles:
+                    try:
+                        await member.remove_roles(rol, reason="48h expiradas")
+                    except Exception:
+                        pass
+
+    @_check_roles_task.before_loop
+    async def _before_check(self):
+        await self.bot.wait_until_ready()
+        result = await asyncio.to_thread(
+            lambda: get_db().table("rol_expiraciones").select("usuario_id, expira_en").execute()
+        )
+        ahora = datetime.datetime.now(datetime.timezone.utc)
+        for row in result.data:
+            expira = datetime.datetime.fromisoformat(row["expira_en"])
+            if expira.tzinfo is None:
+                expira = expira.replace(tzinfo=datetime.timezone.utc)
+            if expira > ahora:
+                self.perdedor_expiry[row["usuario_id"]] = expira
+            else:
+                # Ya expiró mientras el bot estaba apagado — limpiar
+                await asyncio.to_thread(
+                    lambda u=row["usuario_id"]: get_db().table("rol_expiraciones")
+                        .delete().eq("usuario_id", u).execute()
+                )
+
+    # ── Zapato compartido ─────────────────────────────────────────────────────
+
+    def _inicializar_zapato(self):
+        cartas = [f"{v}{p}" for p in PALOS for v in VALORES]
+        self.zapato = cartas * NUM_MAZOS
+        random.shuffle(self.zapato)
+        self.shuffle_pendiente = False
+
+    def _repartir_carta(self) -> str:
+        if self.shuffle_pendiente or len(self.zapato) < ZAPATO_MINIMO:
+            self._inicializar_zapato()
+        return self.zapato.pop()
+
+    def _bj_registrar_resultado(self, user_id: str, gano: bool) -> bool:
+        """Actualiza racha y retorna True si se activa shuffle por racha."""
+        if gano:
+            self.bj_racha_gana[user_id] = self.bj_racha_gana.get(user_id, 0) + 1
+            if self.bj_racha_gana[user_id] >= RACHA_MAX_GANA:
+                self.shuffle_pendiente = True
+                self.bj_racha_gana[user_id] = 0
+                return True
+        else:
+            self.bj_racha_gana[user_id] = 0
+        return False
+
+    # ── Seguimiento diario ────────────────────────────────────────────────────
+
+    def _get_hoy_data(self, user_id: str) -> dict:
+        hoy = datetime.date.today().isoformat()
+        data = self.casino_hoy.get(user_id, {"fecha": hoy, "perdidas": 0, "apostado": 0})
+        if data["fecha"] != hoy:
+            data = {"fecha": hoy, "perdidas": 0, "apostado": 0}
+        return data
+
+    def _registrar_apuesta(self, user_id: str, valor: int):
+        data = self._get_hoy_data(user_id)
+        data["apostado"] += valor
+        self.casino_hoy[user_id] = data
+
+    def _registrar_perdida(self, user_id: str, valor: int):
+        data = self._get_hoy_data(user_id)
+        data["perdidas"] += valor
+        self.casino_hoy[user_id] = data
+
+    def _perdido_hoy(self, user_id: str) -> int:
+        return self._get_hoy_data(user_id)["perdidas"]
+
+    def _apostado_hoy(self, user_id: str) -> int:
+        return self._get_hoy_data(user_id)["apostado"]
+
+    # ── Rol de perdedor ───────────────────────────────────────────────────────
+
+    async def _tiene_rol_perdedor(self, member: discord.Member) -> bool:
+        return any(r.name == ROL_PERDEDOR for r in member.roles)
+
+    async def _aplicar_rol_perdedor(self, ctx, user_id: str):
+        guild = ctx.guild
+        member = guild.get_member(int(user_id))
+        if not member:
+            return
+        if await self._tiene_rol_perdedor(member):
+            return
+
+        rol = discord.utils.get(guild.roles, name=ROL_PERDEDOR)
+        if not rol:
+            return
+
+        try:
+            await member.add_roles(rol, reason="Perdió más de 3M en el casino")
+        except Exception:
+            return
+
+        expira = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=48)
+        self.perdedor_expiry[user_id] = expira
+        await asyncio.to_thread(
+            lambda: get_db().table("rol_expiraciones").upsert(
+                {"usuario_id": user_id, "rol": ROL_PERDEDOR, "expira_en": expira.isoformat()},
+                on_conflict="usuario_id"
+            ).execute()
+        )
+
+        canal = discord.utils.get(guild.channels, name=CANAL_VERGUENZA)
+        if canal:
+            rol_miembro = discord.utils.get(guild.roles, name="Miembro")
+            monto = self._perdido_hoy(user_id)
+            embed = discord.Embed(
+                title="🏦 NUEVO FINANCIADOR DEL CASINO 💸",
+                description=(
+                    f"Señores y señoras...\n\n"
+                    f"{member.mention} ha donado **generosamente** {self.fmt(monto)} silver "
+                    f"al casino en un solo día.\n\n"
+                    f"Por tan **invaluable** contribución, se le otorga el codiciado título de:\n"
+                    f"🎖️ **{ROL_PERDEDOR}** 🎖️\n\n"
+                    f"Su límite de apuesta queda reducido a **1.000.000 silver diario**.\n"
+                    f"El rol se quitará en **48 horas**. ¡Que todos lo conozcan! 😂"
+                ),
+                color=discord.Color.dark_gold()
+            )
+            embed.set_thumbnail(url="https://i.imgur.com/nKzGFzO.png")
+            embed.set_footer(text="Albion Casino — Financiado por sus propios jugadores")
+            ping = rol_miembro.mention if rol_miembro else ""
+            await canal.send(content=f"🚨 {ping} — ¡Nueva víctima del casino!", embed=embed)
+
+    # ── Utilidades ────────────────────────────────────────────────────────────
 
     def fmt(self, n: int) -> str:
         return f"{n:,}".replace(",", ".")
@@ -55,8 +225,10 @@ class Casino(commands.Cog):
     def cvt(self, s: str) -> int:
         t = str(s).lower().strip()
         try:
-            if t.endswith("k"): return int(float(t[:-1]) * 1_000)
-            if t.endswith("m"): return int(float(t[:-1]) * 1_000_000)
+            if t.endswith("k"):
+                return int(float(t[:-1]) * 1_000)
+            if t.endswith("m"):
+                return int(float(t[:-1]) * 1_000_000)
             return int(float(t))
         except Exception:
             return 0
@@ -95,26 +267,59 @@ class Casino(commands.Cog):
         if valor <= 0:
             await ctx.send("❌ La apuesta debe ser mayor a 0.", delete_after=5)
             return False
-        if valor > MAX_APUESTA:
-            await ctx.send(f"❌ La apuesta máxima contra la casa es **{self.fmt(MAX_APUESTA)}** silver.", delete_after=5)
+
+        uid = str(ctx.author.id)
+        tiene_rol = await self._tiene_rol_perdedor(ctx.author)
+        max_apuesta = MAX_APUESTA
+
+        if tiene_rol:
+            apostado = self._apostado_hoy(uid)
+            restante = max(0, LIMITE_APUESTA_PERDEDOR - apostado)
+            if restante <= 0:
+                await ctx.send(
+                    f"❌ Como **{ROL_PERDEDOR}** has agotado tu límite diario de "
+                    f"**{self.fmt(LIMITE_APUESTA_PERDEDOR)} silver**. Vuelve mañana.",
+                    delete_after=8
+                )
+                return False
+            max_apuesta = min(MAX_APUESTA, restante)
+
+        if valor > max_apuesta:
+            if tiene_rol:
+                await ctx.send(
+                    f"❌ Solo puedes apostar **{self.fmt(max_apuesta)}** silver más hoy "
+                    f"(límite diario de **{ROL_PERDEDOR}**).",
+                    delete_after=8
+                )
+            else:
+                await ctx.send(
+                    f"❌ La apuesta máxima es **{self.fmt(MAX_APUESTA)}** silver.", delete_after=5
+                )
             return False
+
         r = await asyncio.to_thread(
             lambda: get_db().table("balances").select("balance")
-                .eq("usuario_id", str(ctx.author.id)).execute()
+                .eq("usuario_id", uid).execute()
         )
         saldo = r.data[0]["balance"] if r.data else 0
         if saldo < valor:
             await ctx.send(f"❌ No tienes suficiente silver. Tienes **{self.fmt(saldo)}**.", delete_after=5)
             return False
+
         banco = await self.get_banco()
         if banco < valor * 2:
             await ctx.send(
-                f"❌ El banco del gremio no tiene fondos suficientes para cubrir esta apuesta.\n"
-                f"Reservas actuales: **{self.fmt(banco)}** silver. Pide a un GM que deposite más.",
+                f"❌ El banco no tiene fondos suficientes.\nReservas: **{self.fmt(banco)}** silver.",
                 delete_after=8
             )
             return False
         return True
+
+    async def _check_perdedor(self, ctx, user_id: str, perdida: int):
+        self._registrar_perdida(user_id, perdida)
+        total = self._perdido_hoy(user_id)
+        if total >= LIMITE_PERDEDOR_DIA:
+            await self._aplicar_rol_perdedor(ctx, user_id)
 
     # ── BANCO ─────────────────────────────────────────────────────────────────
 
@@ -127,7 +332,7 @@ class Casino(commands.Cog):
             description=f"**Reservas actuales:** {self.fmt(banco)} silver",
             color=discord.Color.gold()
         )
-        embed.set_footer(text="Usa /banco_depositar para añadir fondos")
+        embed.set_footer(text="Usa /banco_depositar · /banco_retirar")
         await ctx.send(embed=embed, ephemeral=True)
 
     @commands.hybrid_command(name="banco_depositar", description="Añade silver al banco del gremio")
@@ -143,6 +348,33 @@ class Casino(commands.Cog):
             title="🏦 Depósito realizado",
             description=f"Se añadieron **{self.fmt(valor)}** silver.\n**Nuevo balance:** {self.fmt(banco)} silver",
             color=discord.Color.green()
+        ))
+
+    @commands.hybrid_command(name="banco_retirar", description="Retira silver del banco del gremio (para registrar ganancias)")
+    @app_commands.describe(
+        cantidad="Cantidad a retirar (Ej: 5m, 500k)",
+        motivo="Motivo del retiro"
+    )
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def banco_retirar(self, ctx, cantidad: str, *, motivo: str = "Retiro de ganancias"):
+        valor = self.cvt(cantidad)
+        if valor <= 0:
+            return await ctx.send("❌ Cantidad inválida.", delete_after=5)
+        banco = await self.get_banco()
+        if banco < valor:
+            return await ctx.send(
+                f"❌ El banco solo tiene **{self.fmt(banco)}** silver disponibles.", delete_after=5
+            )
+        await self.mover_banco(-valor, "retiro", f"{motivo} — por {ctx.author.display_name}")
+        banco_nuevo = await self.get_banco()
+        await ctx.send(embed=discord.Embed(
+            title="🏦 Retiro realizado",
+            description=(
+                f"Se retiraron **{self.fmt(valor)}** silver.\n"
+                f"**Motivo:** {motivo}\n"
+                f"**Nuevo balance:** {self.fmt(banco_nuevo)} silver"
+            ),
+            color=discord.Color.orange()
         ))
 
     # ── RULETA RUSA ───────────────────────────────────────────────────────────
@@ -170,9 +402,7 @@ class Casino(commands.Cog):
         await _actualizar_balance(ctx.author, -valor, "entrada_ruleta", "Entrada Ruleta Rusa")
 
         view = RuletaView(self, valor, ctx)
-        msg  = await ctx.send(embed=self._embed_ruleta_lobby(view.jugadores, valor), view=view)
-
-        # El juego corre en background; el comando responde de inmediato
+        msg = await ctx.send(embed=self._embed_ruleta_lobby(view.jugadores, valor), view=view)
         asyncio.create_task(self._jugar_ruleta(ctx, view, msg, valor))
 
     async def _jugar_ruleta(self, ctx, view: "RuletaView", msg: discord.Message, valor: int):
@@ -190,15 +420,14 @@ class Casino(commands.Cog):
                 return
 
             await msg.delete()
-
             jugadores_vivos = view.jugadores.copy()
-            eliminados      = []
+            eliminados = []
             random.shuffle(jugadores_vivos)
             idx = 0
 
             while len(jugadores_vivos) > 1:
-                bala         = random.randint(1, 6)
-                tambor       = 1
+                bala = random.randint(1, 6)
+                tambor = 1
                 ronda_activa = True
 
                 while ronda_activa and len(jugadores_vivos) > 1:
@@ -219,10 +448,9 @@ class Casino(commands.Cog):
                     else:
                         await m.edit(content=f"😮‍💨 **{jugador.display_name}** — *click*. Sigue vivo.")
                         tambor += 1
-                        idx    += 1
+                        idx += 1
                         await asyncio.sleep(1)
 
-            # Borrar todos los mensajes intermedios
             for m in mensajes_tmp:
                 try:
                     await m.delete()
@@ -230,7 +458,7 @@ class Casino(commands.Cog):
                     pass
 
             ganador = jugadores_vivos[0]
-            bote    = valor * len(view.jugadores)
+            bote = valor * len(view.jugadores)
             await _actualizar_balance(ganador, bote, "premio_ruleta", "Premio Mayor Ruleta Rusa")
 
             resumen_eliminados = "\n".join(f"💀 {j.display_name}" for j in eliminados)
@@ -255,7 +483,7 @@ class Casino(commands.Cog):
 
     def _embed_ruleta_lobby(self, jugadores: list, valor: int) -> discord.Embed:
         lista = "\n".join(f"🔫 {j.display_name}" for j in jugadores)
-        bote  = valor * len(jugadores)
+        bote = valor * len(jugadores)
         return discord.Embed(
             title="🔫 RULETA RUSA",
             description=(
@@ -281,7 +509,7 @@ class Casino(commands.Cog):
     # ── DADOS (vs casa) ───────────────────────────────────────────────────────
 
     @commands.hybrid_command(name="dados", description="🎲 Tira un dado contra la casa — el mayor gana")
-    @app_commands.describe(apuesta="Plata a apostar (máx 500k — Ej: 100k)")
+    @app_commands.describe(apuesta="Plata a apostar (máx 300k — Ej: 100k)")
     async def dados(self, ctx, apuesta: str):
         valor = self.cvt(apuesta)
         if not await self.validar_apuesta(ctx, valor):
@@ -290,11 +518,12 @@ class Casino(commands.Cog):
             return await ctx.send("❌ Ya tienes un juego activo.", delete_after=5)
 
         self.jugando.add(str(ctx.author.id))
+        uid = str(ctx.author.id)
+        self._registrar_apuesta(uid, valor)
         try:
             await _actualizar_balance(ctx.author, -valor, "entrada_casino", "Entrada Dados")
             await self.mover_banco(valor, "ingreso_casino", "Entrada Dados")
 
-            # Animación de dados girando
             msg = await ctx.send(embed=discord.Embed(
                 title="🎲 DADOS vs CASA",
                 description="```\n  🎲  Los dados ruedan...\n```",
@@ -310,27 +539,28 @@ class Casino(commands.Cog):
                 ))
 
             await asyncio.sleep(0.9)
-            tu_dado   = random.randint(1, 6)
+            tu_dado = random.randint(1, 6)
             casa_dado = random.randint(1, 6)
 
             if tu_dado > casa_dado:
                 titulo = "🎲 ¡GANASTE!"
-                color  = discord.Color.green()
+                color = discord.Color.green()
                 await _actualizar_balance(ctx.author, valor * 2, "premio_casino", f"Dados — ganancia +{self.fmt(valor)}")
                 await self.mover_banco(-valor * 2, "pago_casino", f"Dados — pago a {ctx.author.display_name}")
                 resultado = f"✅ **+{self.fmt(valor)} silver**"
             elif tu_dado < casa_dado:
-                titulo    = "🎲 PERDISTE"
-                color     = discord.Color.red()
+                titulo = "🎲 PERDISTE"
+                color = discord.Color.red()
                 resultado = f"❌ **-{self.fmt(valor)} silver**"
+                await self._check_perdedor(ctx, uid, valor)
             else:
                 titulo = "🎲 EMPATE — Bote devuelto"
-                color  = discord.Color.greyple()
+                color = discord.Color.greyple()
                 await _actualizar_balance(ctx.author, valor, "empate_casino", "Dados — Empate")
                 await self.mover_banco(-valor, "empate_casino", "Dados — Empate")
                 resultado = "↩️ Se devuelve tu apuesta"
 
-            saldo_actual = await self.get_user_balance(str(ctx.author.id))
+            saldo_actual = await self.get_user_balance(uid)
             desc = (
                 "```\n"
                 f"  TÚ              CASA\n"
@@ -343,12 +573,12 @@ class Casino(commands.Cog):
             await msg.edit(embed=discord.Embed(title=titulo, description=desc, color=color))
 
         finally:
-            self.jugando.discard(str(ctx.author.id))
+            self.jugando.discard(uid)
 
-    # ── BLACKJACK (vs casa) ───────────────────────────────────────────────────
+    # ── BLACKJACK (vs casa, zapato compartido de 6 mazos) ────────────────────
 
     @commands.hybrid_command(name="blackjack", description="🃏 Blackjack contra la casa — llega a 21")
-    @app_commands.describe(apuesta="Plata a apostar (máx 500k — Ej: 200k)")
+    @app_commands.describe(apuesta="Plata a apostar (máx 300k — Ej: 200k)")
     async def blackjack(self, ctx, apuesta: str):
         valor = self.cvt(apuesta)
         if not await self.validar_apuesta(ctx, valor):
@@ -356,55 +586,61 @@ class Casino(commands.Cog):
         if str(ctx.author.id) in self.jugando:
             return await ctx.send("❌ Ya tienes un juego activo.", delete_after=5)
 
-        self.jugando.add(str(ctx.author.id))
+        uid = str(ctx.author.id)
+        self.jugando.add(uid)
+        self._registrar_apuesta(uid, valor)
         try:
             await _actualizar_balance(ctx.author, -valor, "entrada_casino", "Entrada Blackjack")
             await self.mover_banco(valor, "ingreso_casino", "Entrada Blackjack")
 
-            baraja     = nueva_baraja()
-            random.shuffle(baraja)
-            mano_j     = [baraja.pop(), baraja.pop()]
-            mano_c     = [baraja.pop(), baraja.pop()]
-            total_j    = calcular_mano(mano_j)
+            mano_j = [self._repartir_carta(), self._repartir_carta()]
+            mano_c = [self._repartir_carta(), self._repartir_carta()]
+            total_j = calcular_mano(mano_j)
 
-            # Blackjack natural inmediato
+            cartas_restantes = len(self.zapato)
+
             if total_j == 21:
                 total_c = calcular_mano(mano_c)
                 if total_c == 21:
                     await _actualizar_balance(ctx.author, valor, "empate_casino", "BJ Natural — Empate")
                     await self.mover_banco(-valor, "empate_casino", "BJ Natural — Empate")
                     titulo, color, resultado = "🃏 EMPATE — Ambos tienen Blackjack", discord.Color.greyple(), "↩️ Se devuelve tu apuesta."
+                    self._bj_registrar_resultado(uid, False)
                 else:
                     premio = int(valor * 1.5)
                     await _actualizar_balance(ctx.author, valor + premio, "premio_casino", f"BJ Natural +{self.fmt(premio)}")
                     await self.mover_banco(-(valor + premio), "pago_casino", f"BJ Natural a {ctx.author.display_name}")
                     titulo, color, resultado = "🃏 ¡BLACKJACK NATURAL! 🎉", discord.Color.gold(), f"✅ Ganas **{self.fmt(premio)}** silver extra."
-                saldo_actual = await self.get_user_balance(str(ctx.author.id))
-                embed = self._embed_bj(mano_j, mano_c, total_j, total_c, False)
-                embed.title       = titulo
-                embed.color       = color
+                    shuffle_activado = self._bj_registrar_resultado(uid, True)
+                    if shuffle_activado:
+                        resultado += "\n🔀 *¡Racha de 3 victorias! El zapato se ha barajado.*"
+
+                saldo_actual = await self.get_user_balance(uid)
+                embed = self._embed_bj(mano_j, mano_c, total_j, calcular_mano(mano_c), False, cartas_restantes)
+                embed.title = titulo
+                embed.color = color
                 embed.description = f"{resultado}\n💰 Balance: **{self.fmt(saldo_actual)} silver**"
                 return await ctx.send(embed=embed)
 
-            view      = BlackjackView(self, mano_j, mano_c, baraja, valor, ctx)
-            embed     = self._embed_bj(mano_j, mano_c, total_j, None, True)
-            msg       = await ctx.send(embed=embed, view=view)
-            view.msg  = msg
+            view = BlackjackView(self, mano_j, mano_c, valor, ctx, cartas_restantes)
+            embed = self._embed_bj(mano_j, mano_c, total_j, None, True, cartas_restantes)
+            msg = await ctx.send(embed=embed, view=view)
+            view.msg = msg
             await view.wait()
 
         finally:
-            self.jugando.discard(str(ctx.author.id))
+            self.jugando.discard(uid)
 
-    def _embed_bj(self, mano_j, mano_c, total_j, total_c, ocultar) -> discord.Embed:
+    def _embed_bj(self, mano_j, mano_c, total_j, total_c, ocultar, cartas_restantes=None) -> discord.Embed:
         cartas_j = render_mano(mano_j)
         cartas_c = render_mano(mano_c, ocultar)
         if ocultar:
             info_c = f"Carta visible: **{mano_c[0]}**"
         else:
-            tc     = total_c if total_c is not None else calcular_mano(mano_c)
+            tc = total_c if total_c is not None else calcular_mano(mano_c)
             info_c = f"Total: **{tc}**{'  💥 ¡PASADO!' if tc > 21 else ''}"
 
-        return discord.Embed(
+        embed = discord.Embed(
             title="🃏 BLACKJACK",
             color=discord.Color.blurple()
         ).add_field(
@@ -417,15 +653,95 @@ class Casino(commands.Cog):
             inline=False
         )
 
+        if cartas_restantes is not None:
+            mazos = cartas_restantes / 52
+            embed.set_footer(text=f"Zapato: {cartas_restantes} cartas (~{mazos:.1f} mazos) | 6 mazos totales")
 
-# ── Views ─────────────────────────────────────────────────────────────────────
+        return embed
+
+    # ── SORTEO TOP 10 PARTICIPACIÓN ───────────────────────────────────────────
+
+    @commands.hybrid_command(
+        name="sorteo_participacion",
+        description="🎰 Sorteo épico entre los 10 más activos de los últimos 7 días"
+    )
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def sorteo_participacion(self, ctx):
+        await ctx.defer()
+
+        hace_7_dias = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+        ).isoformat()
+
+        result = await asyncio.to_thread(
+            lambda: get_db().table("asistencias")
+                .select("usuario_id, usuario_nombre, registros_actividad(multiplicador)")
+                .gte("fecha", hace_7_dias)
+                .execute()
+        )
+
+        if not result.data:
+            return await ctx.send("❌ No hay asistencias en los últimos 7 días.", delete_after=8)
+
+        conteo: dict[str, dict] = {}
+        for row in result.data:
+            uid = row["usuario_id"]
+            ra = row.get("registros_actividad") or {}
+            mult = ra.get("multiplicador") or 1
+            if uid not in conteo:
+                conteo[uid] = {"nombre": row["usuario_nombre"], "puntos": 0}
+            conteo[uid]["puntos"] += mult
+
+        top_raw = sorted(conteo.items(), key=lambda x: -x[1]["puntos"])[:10]
+
+        if len(top_raw) < 2:
+            return await ctx.send("❌ Hacen falta al menos 2 participantes.", delete_after=8)
+
+        candidatos = []
+        for uid, data in top_raw:
+            member = ctx.guild.get_member(int(uid)) if uid.isdigit() else None
+            candidatos.append({
+                "id": uid,
+                "nombre": member.display_name if member else data["nombre"],
+                "puntos": data["puntos"],
+            })
+
+        view = SorteoView(self, candidatos, ctx)
+        embed = self._embed_sorteo_lobby(candidatos)
+        msg = await ctx.send(embed=embed, view=view)
+        view.msg = msg
+
+    def _embed_sorteo_lobby(self, candidatos: list) -> discord.Embed:
+        medallas = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        lineas = []
+        for i, c in enumerate(candidatos):
+            lineas.append(f"{medallas[i]} **{c['nombre']}** — {c['puntos']} pts")
+
+        embed = discord.Embed(
+            title="🎰 SORTEO DE PARTICIPACIÓN — TOP 10",
+            description=(
+                "```\n"
+                "╔═══════════════════════════════╗\n"
+                "║   Los más activos de la semana ║\n"
+                "╚═══════════════════════════════╝\n"
+                "```\n" +
+                "\n".join(lineas) +
+                "\n\n*El organizador pulsa el botón para iniciar.*"
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="Últimos 7 días • Ponderado por multiplicador de actividad")
+        return embed
+
+
+# ── Views ──────────────────────────────────────────────────────────────────────
 
 class RuletaView(discord.ui.View):
     def __init__(self, cog, valor, ctx):
         super().__init__(timeout=300)
-        self.cog    = cog
-        self.valor  = valor
-        self.ctx    = ctx
+        self.cog = cog
+        self.valor = valor
+        self.ctx = ctx
         self.jugadores = [ctx.author]
 
     @discord.ui.button(label="✅ Unirse", style=discord.ButtonStyle.green)
@@ -467,58 +783,75 @@ class RuletaView(discord.ui.View):
 
 
 class BlackjackView(discord.ui.View):
-    def __init__(self, cog, mano_j, mano_c, baraja, valor, ctx):
+    def __init__(self, cog, mano_j, mano_c, valor, ctx, cartas_restantes=None):
         super().__init__(timeout=60)
-        self.cog    = cog
+        self.cog = cog
         self.mano_j = mano_j
         self.mano_c = mano_c
-        self.baraja = baraja
-        self.valor  = valor
-        self.ctx    = ctx
-        self.msg    = None
+        self.valor = valor
+        self.ctx = ctx
+        self.msg = None
+        self.cartas_restantes = cartas_restantes
 
     async def on_timeout(self):
         if self.msg:
             saldo_actual = await self.cog.get_user_balance(str(self.ctx.author.id))
             await self.msg.edit(embed=discord.Embed(
                 title="🃏 Tiempo agotado — Perdiste",
-                description=f"No respondiste a tiempo. La apuesta se pierde.\n❌ **-{self.cog.fmt(self.valor)} silver**\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**",
+                description=(
+                    f"No respondiste a tiempo. La apuesta se pierde.\n"
+                    f"❌ **-{self.cog.fmt(self.valor)} silver**\n"
+                    f"💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
+                ),
                 color=discord.Color.red()
             ), view=None)
-        self.cog.jugando.discard(str(self.ctx.author.id))
+        uid = str(self.ctx.author.id)
+        await self.cog._check_perdedor(self.ctx, uid, self.valor)
+        self.cog.jugando.discard(uid)
 
     async def _resolver(self, interaction: discord.Interaction):
         while calcular_mano(self.mano_c) < 17:
-            self.mano_c.append(self.baraja.pop())
+            self.mano_c.append(self.cog._repartir_carta())
 
         total_j = calcular_mano(self.mano_j)
         total_c = calcular_mano(self.mano_c)
-        embed   = self.cog._embed_bj(self.mano_j, self.mano_c, total_j, total_c, False)
+        uid = str(self.ctx.author.id)
+        embed = self.cog._embed_bj(self.mano_j, self.mano_c, total_j, total_c, False, len(self.cog.zapato))
 
         resultado_str = ""
+        shuffle_msg = ""
+
         if total_j > 21:
             embed.title = "🃏 ¡TE PASASTE! Perdiste."
             embed.color = discord.Color.red()
             resultado_str = f"❌ **-{self.cog.fmt(self.valor)} silver**"
+            self.cog._bj_registrar_resultado(uid, False)
+            await self.cog._check_perdedor(self.ctx, uid, self.valor)
         elif total_c > 21 or total_j > total_c:
             embed.title = "🃏 ¡GANASTE!"
             embed.color = discord.Color.green()
             resultado_str = f"✅ **+{self.cog.fmt(self.valor)} silver**"
             await _actualizar_balance(self.ctx.author, self.valor * 2, "premio_casino", f"BJ win +{self.cog.fmt(self.valor)}")
             await self.cog.mover_banco(-self.valor * 2, "pago_casino", f"BJ pago a {self.ctx.author.display_name}")
+            shuffle_activado = self.cog._bj_registrar_resultado(uid, True)
+            if shuffle_activado:
+                shuffle_msg = "\n🔀 *¡3 victorias seguidas! El zapato se ha barajado.*"
         elif total_j == total_c:
             embed.title = "🃏 EMPATE — Se devuelve tu apuesta"
             embed.color = discord.Color.greyple()
             resultado_str = "↩️ Se devuelve tu apuesta"
             await _actualizar_balance(self.ctx.author, self.valor, "empate_casino", "BJ Empate")
             await self.cog.mover_banco(-self.valor, "empate_casino", "BJ Empate")
+            self.cog._bj_registrar_resultado(uid, False)
         else:
             embed.title = "🃏 PERDISTE"
             embed.color = discord.Color.red()
             resultado_str = f"❌ **-{self.cog.fmt(self.valor)} silver**"
+            self.cog._bj_registrar_resultado(uid, False)
+            await self.cog._check_perdedor(self.ctx, uid, self.valor)
 
-        saldo_actual = await self.cog.get_user_balance(str(self.ctx.author.id))
-        embed.description = f"{resultado_str}\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
+        saldo_actual = await self.cog.get_user_balance(uid)
+        embed.description = f"{resultado_str}{shuffle_msg}\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
         await self.msg.edit(embed=embed, view=None)
         self.stop()
 
@@ -527,19 +860,29 @@ class BlackjackView(discord.ui.View):
         if interaction.user != self.ctx.author:
             return await interaction.response.send_message("❌ No es tu juego.", ephemeral=True)
 
-        self.mano_j.append(self.baraja.pop())
+        self.mano_j.append(self.cog._repartir_carta())
         total = calcular_mano(self.mano_j)
 
         if total > 21:
-            embed = self.cog._embed_bj(self.mano_j, self.mano_c, total, calcular_mano(self.mano_c), False)
+            uid = str(self.ctx.author.id)
+            embed = self.cog._embed_bj(
+                self.mano_j, self.mano_c, total, calcular_mano(self.mano_c), False, len(self.cog.zapato)
+            )
             embed.title = "🃏 ¡TE PASASTE! Perdiste."
             embed.color = discord.Color.red()
-            saldo_actual = await self.cog.get_user_balance(str(self.ctx.author.id))
-            embed.description = f"❌ **-{self.cog.fmt(self.valor)} silver**\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
+            saldo_actual = await self.cog.get_user_balance(uid)
+            self.cog._bj_registrar_resultado(uid, False)
+            await self.cog._check_perdedor(self.ctx, uid, self.valor)
+            embed.description = (
+                f"❌ **-{self.cog.fmt(self.valor)} silver**\n"
+                f"💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
+            )
             await self.msg.edit(embed=embed, view=None)
             self.stop()
         else:
-            await self.msg.edit(embed=self.cog._embed_bj(self.mano_j, self.mano_c, total, None, True))
+            await self.msg.edit(
+                embed=self.cog._embed_bj(self.mano_j, self.mano_c, total, None, True, len(self.cog.zapato))
+            )
 
         await interaction.response.defer()
 
@@ -556,15 +899,17 @@ class BlackjackView(discord.ui.View):
             return await interaction.response.send_message("❌ No es tu juego.", ephemeral=True)
 
         await interaction.response.defer()
+        uid = str(self.ctx.author.id)
 
         r = await asyncio.to_thread(
             lambda: get_db().table("balances").select("balance")
-                .eq("usuario_id", str(self.ctx.author.id)).execute()
+                .eq("usuario_id", uid).execute()
         )
         saldo = r.data[0]["balance"] if r.data else 0
         if saldo < self.valor:
             return await interaction.followup.send(
-                f"❌ No tienes suficiente silver para doblar ({self.cog.fmt(self.valor)} requerido).", ephemeral=True
+                f"❌ No tienes suficiente silver para doblar ({self.cog.fmt(self.valor)} requerido).",
+                ephemeral=True
             )
         banco = await self.cog.get_banco()
         if banco < self.valor * 3:
@@ -572,12 +917,139 @@ class BlackjackView(discord.ui.View):
                 "❌ El banco no tiene fondos para cubrir la apuesta doble.", ephemeral=True
             )
 
+        self.cog._registrar_apuesta(uid, self.valor)
         await _actualizar_balance(self.ctx.author, -self.valor, "entrada_casino", "Doble Blackjack")
         await self.cog.mover_banco(self.valor, "ingreso_casino", "Doble Blackjack")
         self.valor *= 2
 
-        self.mano_j.append(self.baraja.pop())
+        self.mano_j.append(self.cog._repartir_carta())
         await self._resolver(interaction)
+
+
+class SorteoView(discord.ui.View):
+    def __init__(self, cog, candidatos: list, ctx):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.candidatos = candidatos
+        self.ctx = ctx
+        self.msg = None
+        self.en_curso = False
+
+    @discord.ui.button(label="🎰 Iniciar Sorteo", style=discord.ButtonStyle.green, emoji="🎲")
+    async def btn_iniciar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message(
+                "❌ Solo el organizador puede iniciar el sorteo.", ephemeral=True
+            )
+        if self.en_curso:
+            return await interaction.response.send_message("❌ El sorteo ya está en curso.", ephemeral=True)
+
+        self.en_curso = True
+        button.disabled = True
+        button.label = "En curso..."
+        await interaction.response.edit_message(view=self)
+        asyncio.create_task(self._animar_sorteo())
+
+    async def _animar_sorteo(self):
+        restantes = self.candidatos.copy()
+        eliminados: list = []
+
+        # Fase de suspenso: "girando" 3 segundos
+        simbolos = ["🎰", "🎲", "🃏", "🎯", "🎪"]
+        for _ in range(6):
+            simbolo = random.choice(simbolos)
+            elegido = random.choice(restantes)
+            embed = self._embed_girando(restantes, eliminados, elegido["nombre"], simbolo)
+            await self.msg.edit(embed=embed)
+            await asyncio.sleep(0.5)
+
+        # Eliminar uno a uno
+        while len(restantes) > 1:
+            # Suspenso breve antes de eliminar
+            victima = random.choice(restantes)
+            for i in range(3):
+                puntos = "." * (i + 1)
+                embed = self._embed_eliminando(restantes, eliminados, puntos)
+                await self.msg.edit(embed=embed)
+                await asyncio.sleep(0.7)
+
+            restantes.remove(victima)
+            eliminados.append(victima)
+
+            embed = self._embed_eliminacion(restantes, eliminados, victima)
+            await self.msg.edit(embed=embed)
+            await asyncio.sleep(2.2)
+
+        # Ganador
+        ganador = restantes[0]
+        await asyncio.sleep(1)
+
+        member = self.ctx.guild.get_member(int(ganador["id"])) if ganador["id"].isdigit() else None
+        mention = member.mention if member else ganador["nombre"]
+
+        embed = discord.Embed(
+            title="🏆 ¡TENEMOS GANADOR!",
+            description=(
+                "```\n"
+                "  ✨  ✨  ✨  ✨  ✨  ✨  ✨\n"
+                "```\n"
+                f"# 🎊 {ganador['nombre']} 🎊\n\n"
+                f"**{ganador['puntos']} puntos** de participación esta semana.\n\n"
+                f"*La suerte y el esfuerzo se alían. ¡Felicidades!*\n\n"
+                "```\n"
+                "  ✨  ✨  ✨  ✨  ✨  ✨  ✨\n"
+                "```"
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text=f"Sorteo organizado por {self.ctx.author.display_name}")
+        await self.msg.edit(embed=embed, view=None)
+        await self.ctx.send(f"🎊 ¡El ganador del sorteo es {mention}! ¡Enhorabuena!")
+
+    def _embed_girando(self, restantes, eliminados, destacado, simbolo) -> discord.Embed:
+        lineas = []
+        for c in restantes:
+            if c["nombre"] == destacado:
+                lineas.append(f"**›› {simbolo} {c['nombre']} ‹‹**")
+            else:
+                lineas.append(f"   {c['nombre']}")
+        for c in eliminados:
+            lineas.append(f"~~  {c['nombre']}  ~~ ❌")
+
+        return discord.Embed(
+            title="🎰 GIRANDO...",
+            description="\n".join(lineas),
+            color=discord.Color.blurple()
+        ).set_footer(text="Eligiendo al siguiente eliminado...")
+
+    def _embed_eliminando(self, restantes, eliminados, puntos) -> discord.Embed:
+        lineas = [f"   {c['nombre']}" for c in restantes]
+        for c in eliminados:
+            lineas.append(f"~~  {c['nombre']}  ~~ ❌")
+
+        return discord.Embed(
+            title=f"🎯 Eligiendo víctima{puntos}",
+            description="\n".join(lineas),
+            color=discord.Color.orange()
+        )
+
+    def _embed_eliminacion(self, restantes, eliminados, victima) -> discord.Embed:
+        lineas = [f"   {c['nombre']}" for c in restantes]
+        for c in eliminados:
+            marker = "💥" if c["nombre"] == victima["nombre"] else "❌"
+            lineas.append(f"~~  {c['nombre']}  ~~ {marker}")
+
+        embed = discord.Embed(
+            title="💥 ¡Eliminado!",
+            description="\n".join(lineas),
+            color=discord.Color.red()
+        )
+        quedan = len(restantes)
+        if quedan == 1:
+            embed.set_footer(text="¡Solo queda uno!")
+        else:
+            embed.set_footer(text=f"Quedan {quedan} candidatos...")
+        return embed
 
 
 async def setup(bot):
