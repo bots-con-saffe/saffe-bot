@@ -183,6 +183,9 @@ class Casino(commands.Cog):
 
         try:
             await member.add_roles(rol, reason="Perdió más de 3M en el casino")
+            # Mover el rol al tope (justo debajo del rol más alto del bot)
+            bot_top = guild.me.top_role.position
+            await rol.edit(position=max(1, bot_top - 1))
         except Exception:
             return
 
@@ -376,6 +379,30 @@ class Casino(commands.Cog):
             ),
             color=discord.Color.orange()
         ))
+
+    @commands.hybrid_command(name="quitar_donador", description="Quita el rol Donador Certificado a un miembro manualmente")
+    @app_commands.describe(usuario="El miembro")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def quitar_donador(self, ctx, usuario: discord.Member):
+        rol = discord.utils.get(ctx.guild.roles, name=ROL_PERDEDOR)
+        if not rol or rol not in usuario.roles:
+            return await ctx.send(f"❌ **{usuario.display_name}** no tiene el rol **{ROL_PERDEDOR}**.", delete_after=5)
+
+        await usuario.remove_roles(rol, reason=f"Quitado manualmente por {ctx.author.display_name}")
+
+        uid = str(usuario.id)
+        self.perdedor_expiry.pop(uid, None)
+        await asyncio.to_thread(
+            lambda: get_db().table("rol_expiraciones").delete().eq("usuario_id", uid).execute()
+        )
+
+        await ctx.send(
+            embed=discord.Embed(
+                title="✅ Rol removido",
+                description=f"Se quitó **{ROL_PERDEDOR}** a {usuario.mention} y se eliminó su expiración.",
+                color=discord.Color.green()
+            )
+        )
 
     # ── RULETA RUSA ───────────────────────────────────────────────────────────
 
