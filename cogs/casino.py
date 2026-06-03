@@ -143,9 +143,9 @@ class Casino(commands.Cog):
 
     def _get_hoy_data(self, user_id: str) -> dict:
         hoy = datetime.date.today().isoformat()
-        data = self.casino_hoy.get(user_id, {"fecha": hoy, "perdidas": 0, "apostado": 0})
+        data = self.casino_hoy.get(user_id, {"fecha": hoy, "neto": 0, "apostado": 0})
         if data["fecha"] != hoy:
-            data = {"fecha": hoy, "perdidas": 0, "apostado": 0}
+            data = {"fecha": hoy, "neto": 0, "apostado": 0}
         return data
 
     def _registrar_apuesta(self, user_id: str, valor: int):
@@ -153,13 +153,14 @@ class Casino(commands.Cog):
         data["apostado"] += valor
         self.casino_hoy[user_id] = data
 
-    def _registrar_perdida(self, user_id: str, valor: int):
+    def _actualizar_neto(self, user_id: str, delta: int):
+        """delta negativo = pérdida, positivo = ganancia."""
         data = self._get_hoy_data(user_id)
-        data["perdidas"] += valor
+        data["neto"] += delta
         self.casino_hoy[user_id] = data
 
-    def _perdido_hoy(self, user_id: str) -> int:
-        return self._get_hoy_data(user_id)["perdidas"]
+    def _neto_hoy(self, user_id: str) -> int:
+        return self._get_hoy_data(user_id)["neto"]
 
     def _apostado_hoy(self, user_id: str) -> int:
         return self._get_hoy_data(user_id)["apostado"]
@@ -201,7 +202,7 @@ class Casino(commands.Cog):
         canal = discord.utils.get(guild.channels, name=CANAL_VERGUENZA)
         if canal:
             rol_miembro = discord.utils.get(guild.roles, name="Miembro")
-            monto = self._perdido_hoy(user_id)
+            monto = abs(self._neto_hoy(user_id))
             embed = discord.Embed(
                 title="🏦 NUEVO FINANCIADOR DEL CASINO 💸",
                 description=(
@@ -318,10 +319,10 @@ class Casino(commands.Cog):
             return False
         return True
 
-    async def _check_perdedor(self, ctx, user_id: str, perdida: int):
-        self._registrar_perdida(user_id, perdida)
-        total = self._perdido_hoy(user_id)
-        if total >= LIMITE_PERDEDOR_DIA:
+    async def _check_perdedor(self, ctx, user_id: str, delta: int):
+        """delta negativo = pérdida, positivo = ganancia."""
+        self._actualizar_neto(user_id, delta)
+        if self._neto_hoy(user_id) <= -LIMITE_PERDEDOR_DIA:
             await self._aplicar_rol_perdedor(ctx, user_id)
 
     # ── BANCO ─────────────────────────────────────────────────────────────────
@@ -575,11 +576,12 @@ class Casino(commands.Cog):
                 await _actualizar_balance(ctx.author, valor * 2, "premio_casino", f"Dados — ganancia +{self.fmt(valor)}")
                 await self.mover_banco(-valor * 2, "pago_casino", f"Dados — pago a {ctx.author.display_name}")
                 resultado = f"✅ **+{self.fmt(valor)} silver**"
+                await self._check_perdedor(ctx, uid, +valor)
             elif tu_dado < casa_dado:
                 titulo = "🎲 PERDISTE"
                 color = discord.Color.red()
                 resultado = f"❌ **-{self.fmt(valor)} silver**"
-                await self._check_perdedor(ctx, uid, valor)
+                await self._check_perdedor(ctx, uid, -valor)
             else:
                 titulo = "🎲 EMPATE — Bote devuelto"
                 color = discord.Color.greyple()
@@ -641,6 +643,7 @@ class Casino(commands.Cog):
                     shuffle_activado = self._bj_registrar_resultado(uid, True)
                     if shuffle_activado:
                         resultado += "\n🔀 *¡Racha de 3 victorias! El zapato se ha barajado.*"
+                    await self._check_perdedor(ctx, uid, +premio)
 
                 saldo_actual = await self.get_user_balance(uid)
                 embed = self._embed_bj(mano_j, mano_c, total_j, calcular_mano(mano_c), False, cartas_restantes)
@@ -833,7 +836,7 @@ class BlackjackView(discord.ui.View):
                 color=discord.Color.red()
             ), view=None)
         uid = str(self.ctx.author.id)
-        await self.cog._check_perdedor(self.ctx, uid, self.valor)
+        await self.cog._check_perdedor(self.ctx, uid, -self.valor)
         self.cog.jugando.discard(uid)
 
     async def _resolver(self, interaction: discord.Interaction):
@@ -853,7 +856,7 @@ class BlackjackView(discord.ui.View):
             embed.color = discord.Color.red()
             resultado_str = f"❌ **-{self.cog.fmt(self.valor)} silver**"
             self.cog._bj_registrar_resultado(uid, False)
-            await self.cog._check_perdedor(self.ctx, uid, self.valor)
+            await self.cog._check_perdedor(self.ctx, uid, -self.valor)
         elif total_c > 21 or total_j > total_c:
             embed.title = "🃏 ¡GANASTE!"
             embed.color = discord.Color.green()
@@ -863,6 +866,7 @@ class BlackjackView(discord.ui.View):
             shuffle_activado = self.cog._bj_registrar_resultado(uid, True)
             if shuffle_activado:
                 shuffle_msg = "\n🔀 *¡3 victorias seguidas! El zapato se ha barajado.*"
+            await self.cog._check_perdedor(self.ctx, uid, +self.valor)
         elif total_j == total_c:
             embed.title = "🃏 EMPATE — Se devuelve tu apuesta"
             embed.color = discord.Color.greyple()
@@ -875,7 +879,7 @@ class BlackjackView(discord.ui.View):
             embed.color = discord.Color.red()
             resultado_str = f"❌ **-{self.cog.fmt(self.valor)} silver**"
             self.cog._bj_registrar_resultado(uid, False)
-            await self.cog._check_perdedor(self.ctx, uid, self.valor)
+            await self.cog._check_perdedor(self.ctx, uid, -self.valor)
 
         saldo_actual = await self.cog.get_user_balance(uid)
         embed.description = f"{resultado_str}{shuffle_msg}\n💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
@@ -899,7 +903,7 @@ class BlackjackView(discord.ui.View):
             embed.color = discord.Color.red()
             saldo_actual = await self.cog.get_user_balance(uid)
             self.cog._bj_registrar_resultado(uid, False)
-            await self.cog._check_perdedor(self.ctx, uid, self.valor)
+            await self.cog._check_perdedor(self.ctx, uid, -self.valor)
             embed.description = (
                 f"❌ **-{self.cog.fmt(self.valor)} silver**\n"
                 f"💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
