@@ -189,8 +189,33 @@ class PingsAlbion(commands.Cog):
                 try: await message.delete()
                 except: pass
                 await self.actualizar_mensaje(message.channel, act)
+                await self.notificar_desanotacion(message.channel, act, message.author, num)
 
         await self.bot.process_commands(message)
+
+    async def notificar_desanotacion(self, hilo, act, usuario, num):
+        try:
+            creador_result = await asyncio.to_thread(
+                lambda: get_db().table('registros_actividad')
+                    .select('creado_por')
+                    .eq('id', act['registro_actividad_id'])
+                    .execute()
+            )
+            if not creador_result.data:
+                return
+
+            creador_id = creador_result.data[0]['creado_por']
+            if creador_id == str(usuario.id):
+                return
+
+            puestos = act['puestos_nombres']
+            idx = int(num) - 1
+            nombre_puesto = puestos[idx] if 0 <= idx < len(puestos) else f"Puesto {num}"
+            await hilo.send(
+                f"⚠️ <@{creador_id}>, **{usuario.display_name}** se ha desanotado del puesto **({num}) {nombre_puesto}**."
+            )
+        except Exception as e:
+            print(f"⚠️ Error al notificar desanotación: {e}")
 
     def generar_embed(self, tipo, nombre_contenido, fecha, lugar, nombres, participantes, estado="abierta", motivo=None, link_build=None):
         if estado == "finalizada":
@@ -389,6 +414,7 @@ class PingsAlbion(commands.Cog):
 
         act = result.data[0]
         participantes = act['participantes']
+        puestos_nombres = act['puestos_nombres']
         numeros_existentes = [int(k) for k in participantes.keys() if k.isdigit()]
         ultimo_numero = max(numeros_existentes) if numeros_existentes else 0
 
@@ -396,11 +422,12 @@ class PingsAlbion(commands.Cog):
         for i in range(1, cantidad + 1):
             nuevo_indice = str(ultimo_numero + i)
             participantes[nuevo_indice] = None
+            puestos_nombres.append(act['tipo'].upper())
             nuevos_puestos.append(nuevo_indice)
 
         await asyncio.to_thread(
             lambda: get_db().table('registros_activos')
-                .update({'participantes': participantes})
+                .update({'participantes': participantes, 'puestos_nombres': puestos_nombres})
                 .eq('hilo_id', hilo_id)
                 .execute()
         )
