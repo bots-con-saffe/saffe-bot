@@ -516,10 +516,10 @@ class Casino(commands.Cog):
             title="🔫 RULETA RUSA",
             description=(
                 "```\n"
-                "╔══════════════════════════╗\n"
-                "║  ○  ○  ○  💀  ○  ○      ║\n"
-                "║  ↑  tambor oculto        ║\n"
-                "╚══════════════════════════╝\n"
+                "╔═════════════════════╗\n"
+                "║  ○  ○  ○  💀  ○  ○  ║\n"
+                "║  ↑  tambor oculto   ║\n"
+                "╚═════════════════════╝\n"
                 "```\n"
                 f"**Asiento:** {self.fmt(valor)} silver  •  máx. 6 jugadores"
             ),
@@ -692,7 +692,7 @@ class Casino(commands.Cog):
     # ── SORTEO TOP 10 PARTICIPACIÓN ───────────────────────────────────────────
 
     def _candidatos_sorteo(self, guild, conteo: dict) -> list:
-        """Devuelve los top 10 elegibles (excluye Oficial y Guild Master)."""
+        """Devuelve todos los elegibles ordenados por puntos (excluye Oficial y Guild Master)."""
         roles_excluidos = {"Oficial", "Guild Master"}
         candidatos = []
         for uid, data in sorted(conteo.items(), key=lambda x: -x[1]["puntos"]):
@@ -704,8 +704,6 @@ class Casino(commands.Cog):
                 "nombre": member.display_name if member else data["nombre"],
                 "puntos": data["puntos"],
             })
-            if len(candidatos) == 10:
-                break
         return candidatos
 
     @commands.hybrid_command(
@@ -739,7 +737,7 @@ class Casino(commands.Cog):
                 conteo[uid] = {"nombre": row["usuario_nombre"], "puntos": 0}
             conteo[uid]["puntos"] += mult
 
-        candidatos = self._candidatos_sorteo(ctx.guild, conteo)
+        candidatos = self._candidatos_sorteo(ctx.guild, conteo)[:10]
 
         if not candidatos:
             return await ctx.send("❌ No hay candidatos elegibles.", delete_after=8)
@@ -751,9 +749,10 @@ class Casino(commands.Cog):
             title="🎰 TOP 10 CANDIDATOS AL SORTEO",
             description=(
                 "```\n"
-                "╔═══════════════════════════════╗\n"
-                "║   Los más activos de la semana ║\n"
-                "╚═══════════════════════════════╝\n"
+                "╔═════════════════╗\n"
+                "║ Los más activos ║\n"
+                "║  De la semana   ║\n"
+                "╚═════════════════╝\n"
                 "```\n" +
                 "\n".join(lineas)
             ),
@@ -793,13 +792,13 @@ class Casino(commands.Cog):
                 conteo[uid] = {"nombre": row["usuario_nombre"], "puntos": 0}
             conteo[uid]["puntos"] += mult
 
-        candidatos = self._candidatos_sorteo(ctx.guild, conteo)
+        todos = self._candidatos_sorteo(ctx.guild, conteo)
 
-        if len(candidatos) < 2:
+        if len(todos) < 2:
             return await ctx.send("❌ Hacen falta al menos 2 participantes.", delete_after=8)
 
-        view = SorteoView(self, candidatos, ctx)
-        embed = self._embed_sorteo_lobby(candidatos)
+        view = SorteoView(self, todos, ctx)
+        embed = self._embed_sorteo_lobby(view.candidatos)
         msg = await ctx.send(embed=embed, view=view)
         view.msg = msg
 
@@ -813,9 +812,10 @@ class Casino(commands.Cog):
             title="🎰 SORTEO DE PARTICIPACIÓN — TOP 10",
             description=(
                 "```\n"
-                "╔═══════════════════════════════╗\n"
-                "║   Los más activos de la semana ║\n"
-                "╚═══════════════════════════════╝\n"
+                "╔═════════════════╗\n"
+                "║ Los más activos ║\n"
+                "║  De la semana   ║\n"
+                "╚═════════════════╝\n"
                 "```\n" +
                 "\n".join(lineas) +
                 "\n\n*El organizador pulsa el botón para iniciar.*"
@@ -1020,13 +1020,59 @@ class BlackjackView(discord.ui.View):
 
 
 class SorteoView(discord.ui.View):
-    def __init__(self, cog, candidatos: list, ctx):
+    def __init__(self, cog, todos: list, ctx):
         super().__init__(timeout=600)
         self.cog = cog
-        self.candidatos = candidatos
+        self.candidatos = todos[:10]
+        self.reserva = todos[10:]
         self.ctx = ctx
         self.msg = None
         self.en_curso = False
+        self._actualizar_select()
+
+    def _actualizar_select(self):
+        for item in list(self.children):
+            if isinstance(item, discord.ui.Select):
+                self.remove_item(item)
+
+        if self.en_curso or len(self.candidatos) <= 2:
+            return
+
+        select = discord.ui.Select(
+            placeholder="Excluir participante (entra el siguiente)...",
+            options=[
+                discord.SelectOption(
+                    label=c["nombre"][:100],
+                    value=c["id"],
+                    description=f"{c['puntos']} pts"
+                )
+                for c in self.candidatos
+            ]
+        )
+        select.callback = self._excluir_callback
+        self.add_item(select)
+
+    async def _excluir_callback(self, interaction: discord.Interaction):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message(
+                "❌ Solo el organizador puede modificar el sorteo.", ephemeral=True
+            )
+
+        uid = interaction.data["values"][0]
+        excluido = next((c for c in self.candidatos if c["id"] == uid), None)
+        self.candidatos = [c for c in self.candidatos if c["id"] != uid]
+
+        if self.reserva:
+            siguiente = self.reserva.pop(0)
+            self.candidatos.append(siguiente)
+            nota = f"✅ **{excluido['nombre']}** excluido. Entra **{siguiente['nombre']}** ({siguiente['puntos']} pts)."
+        else:
+            nota = f"✅ **{excluido['nombre']}** excluido. No hay más candidatos en reserva."
+
+        self._actualizar_select()
+        embed = self.cog._embed_sorteo_lobby(self.candidatos)
+        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.followup.send(nota, ephemeral=True)
 
     @discord.ui.button(label="🎰 Iniciar Sorteo", style=discord.ButtonStyle.green, emoji="🎲")
     async def btn_iniciar(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1040,6 +1086,7 @@ class SorteoView(discord.ui.View):
         self.en_curso = True
         button.disabled = True
         button.label = "En curso..."
+        self._actualizar_select()  # elimina el select
         await interaction.response.edit_message(view=self)
 
         menciones = []
