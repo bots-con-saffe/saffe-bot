@@ -691,6 +691,77 @@ class Casino(commands.Cog):
 
     # ── SORTEO TOP 10 PARTICIPACIÓN ───────────────────────────────────────────
 
+    def _candidatos_sorteo(self, guild, conteo: dict) -> list:
+        """Devuelve los top 10 elegibles (excluye Oficial y Guild Master)."""
+        roles_excluidos = {"Oficial", "Guild Master"}
+        candidatos = []
+        for uid, data in sorted(conteo.items(), key=lambda x: -x[1]["puntos"]):
+            member = guild.get_member(int(uid)) if uid.isdigit() else None
+            if member and any(r.name in roles_excluidos for r in member.roles):
+                continue
+            candidatos.append({
+                "id": uid,
+                "nombre": member.display_name if member else data["nombre"],
+                "puntos": data["puntos"],
+            })
+            if len(candidatos) == 10:
+                break
+        return candidatos
+
+    @commands.hybrid_command(
+        name="top_sorteo",
+        description="Muestra el top 10 de candidatos al próximo sorteo (últimos 7 días)"
+    )
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def top_sorteo(self, ctx):
+        await ctx.defer()
+
+        hace_7_dias = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+        ).isoformat()
+
+        result = await asyncio.to_thread(
+            lambda: get_db().table("asistencias")
+                .select("usuario_id, usuario_nombre, registros_actividad(multiplicador)")
+                .gte("fecha", hace_7_dias)
+                .execute()
+        )
+
+        if not result.data:
+            return await ctx.send("❌ No hay asistencias en los últimos 7 días.", delete_after=8)
+
+        conteo: dict[str, dict] = {}
+        for row in result.data:
+            uid = row["usuario_id"]
+            ra = row.get("registros_actividad") or {}
+            mult = ra.get("multiplicador") or 1
+            if uid not in conteo:
+                conteo[uid] = {"nombre": row["usuario_nombre"], "puntos": 0}
+            conteo[uid]["puntos"] += mult
+
+        candidatos = self._candidatos_sorteo(ctx.guild, conteo)
+
+        if not candidatos:
+            return await ctx.send("❌ No hay candidatos elegibles.", delete_after=8)
+
+        medallas = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        lineas = [f"{medallas[i]} **{c['nombre']}** — {c['puntos']} pts" for i, c in enumerate(candidatos)]
+
+        embed = discord.Embed(
+            title="🎰 TOP 10 CANDIDATOS AL SORTEO",
+            description=(
+                "```\n"
+                "╔═══════════════════════════════╗\n"
+                "║   Los más activos de la semana ║\n"
+                "╚═══════════════════════════════╝\n"
+                "```\n" +
+                "\n".join(lineas)
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="Últimos 7 días • Oficiales excluidos del sorteo")
+        await ctx.send(embed=embed)
+
     @commands.hybrid_command(
         name="sorteo_participacion",
         description="🎰 Sorteo épico entre los 10 más activos de los últimos 7 días"
@@ -722,19 +793,10 @@ class Casino(commands.Cog):
                 conteo[uid] = {"nombre": row["usuario_nombre"], "puntos": 0}
             conteo[uid]["puntos"] += mult
 
-        top_raw = sorted(conteo.items(), key=lambda x: -x[1]["puntos"])[:10]
+        candidatos = self._candidatos_sorteo(ctx.guild, conteo)
 
-        if len(top_raw) < 2:
+        if len(candidatos) < 2:
             return await ctx.send("❌ Hacen falta al menos 2 participantes.", delete_after=8)
-
-        candidatos = []
-        for uid, data in top_raw:
-            member = ctx.guild.get_member(int(uid)) if uid.isdigit() else None
-            candidatos.append({
-                "id": uid,
-                "nombre": member.display_name if member else data["nombre"],
-                "puntos": data["puntos"],
-            })
 
         view = SorteoView(self, candidatos, ctx)
         embed = self._embed_sorteo_lobby(candidatos)
@@ -979,6 +1041,13 @@ class SorteoView(discord.ui.View):
         button.disabled = True
         button.label = "En curso..."
         await interaction.response.edit_message(view=self)
+
+        menciones = []
+        for c in self.candidatos:
+            member = self.ctx.guild.get_member(int(c["id"])) if c["id"].isdigit() else None
+            menciones.append(member.mention if member else c["nombre"])
+        await self.ctx.send(f"🎰 ¡Comienza el sorteo! Participantes: {' '.join(menciones)}")
+
         asyncio.create_task(self._animar_sorteo())
 
     async def _animar_sorteo(self):
