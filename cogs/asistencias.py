@@ -105,6 +105,7 @@ class Asistencias(commands.Cog):
 
     @commands.hybrid_command(name="top", description="Ranking de miembros con más actividades en el periodo")
     @app_commands.autocomplete(periodo=periodo_autocomplete)
+    @commands.has_any_role("Oficial", "Guild Master")
     async def top(self, ctx, periodo: str = "semana"):
         await ctx.defer()
 

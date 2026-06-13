@@ -194,18 +194,37 @@ class Silver(commands.Cog):
         venta_rapida="% de descuento aplicado al loot por venta rápida",
         excluir="Miembro a excluir del reparto"
     )
-    @commands.has_any_role("Oficial", "Guild Master")
+    @commands.has_any_role("Oficial", "Guild Master", "Creador de Contenido")
     async def split(self, ctx, bolsas: str, loot: str, costo_mapa: str = "0", tax_porcentaje: int = 15, venta_rapida: int = 0, excluir: discord.Member = None):
         if not isinstance(ctx.channel, discord.Thread):
             return await ctx.send("❌ Usa esto en un hilo activo.", delete_after=5)
         await ctx.defer()
 
-        hilo_id = str(ctx.channel.id)
+        params = dict(bolsas=bolsas, loot=loot, costo_mapa=costo_mapa,
+                      tax_porcentaje=tax_porcentaje, venta_rapida=venta_rapida, excluir=excluir)
+
+        # Creador de Contenido (sin rango de Staff): el split debe aprobarlo un Oficial
+        if not self._es_staff(ctx.author):
+            return await self._solicitar_aprobacion_split(ctx, params, cerrar=True)
+
+        ok, payload = await self._realizar_split(ctx.channel, ctx.guild, cerrar=True, **params)
+        if not ok:
+            return await ctx.send(payload)
+        await ctx.send(embed=payload)
+        await ctx.channel.edit(locked=True, archived=True)
+
+    def _es_staff(self, member) -> bool:
+        return any(r.name in ("Oficial", "Guild Master") for r in member.roles)
+
+    async def _realizar_split(self, channel, guild, *, cerrar, bolsas, loot, costo_mapa="0",
+                              tax_porcentaje=15, venta_rapida=0, excluir=None):
+        """Ejecuta el reparto completo. Devuelve (True, embed) en éxito o (False, mensaje_error)."""
+        hilo_id = str(channel.id)
         result = await asyncio.to_thread(
             lambda: get_db().table('registros_activos').select('*').eq('hilo_id', hilo_id).execute()
         )
         if not result.data:
-            return await ctx.send("❌ No hay una actividad activa registrada en este hilo.")
+            return False, "❌ No hay una actividad activa registrada en este hilo."
 
         registro = result.data[0]
         ids_validos = [uid for uid in registro['participantes'].values() if uid is not None]
@@ -214,12 +233,12 @@ class Silver(commands.Cog):
         for uid in ids_validos:
             if excluir and str(excluir.id) == uid:
                 continue
-            m = ctx.guild.get_member(int(uid))
+            m = guild.get_member(int(uid))
             if m and not m.bot:
                 participantes.append(m)
 
         if not participantes:
-            return await ctx.send("❌ No hay miembros anotados para efectuar el reparto.")
+            return False, "❌ No hay miembros anotados para efectuar el reparto."
 
         v_bolsas = self.convertir_unidad(bolsas)
         v_loot = self.convertir_unidad(loot)
@@ -241,9 +260,12 @@ class Silver(commands.Cog):
         total_neto = max(0, bolsas_restantes + loot_final)
         por_persona = total_neto // len(participantes)
 
+        tipo_tx = "split" if cerrar else "split_medio"
+        motivo = ("Split" if cerrar else "Split Parcial") + f": {channel.name}"
+
         lista_pagos = ""
         for p in participantes:
-            await _actualizar_balance(p, por_persona, "split", f"Split: {ctx.channel.name}")
+            await _actualizar_balance(p, por_persona, tipo_tx, motivo)
             lista_pagos += f"{p.mention}: **{self.formatear(por_persona)}**\n"
 
         # Registrar asistencias
@@ -262,23 +284,29 @@ class Silver(commands.Cog):
             lambda: get_db().table('splits_historial').insert({
                 'hilo_id': hilo_id,
                 'registro_actividad_id': registro['registro_actividad_id'],
-                'tipo_split': 'split',
+                'tipo_split': tipo_tx,
                 'pagos': pagos_split,
-                'cerro_actividad': True,
+                'cerro_actividad': cerrar,
                 'registro_snapshot': registro
             }).execute()
         )
 
-        # Cerrar actividad
-        pings_cog = self.bot.get_cog("PingsAlbion")
-        if pings_cog:
-            await pings_cog.actualizar_mensaje(ctx.channel, registro, estado="finalizada")
+        if cerrar:
+            pings_cog = self.bot.get_cog("PingsAlbion")
+            if pings_cog:
+                await pings_cog.actualizar_mensaje(channel, registro, estado="finalizada")
+            await asyncio.to_thread(
+                lambda: get_db().table('registros_activos').delete().eq('hilo_id', hilo_id).execute()
+            )
 
-        await asyncio.to_thread(
-            lambda: get_db().table('registros_activos').delete().eq('hilo_id', hilo_id).execute()
-        )
-
-        embed = discord.Embed(title="💰 Reparto Avanzado y Asistencia Registrada", color=discord.Color.green())
+        if cerrar:
+            embed = discord.Embed(title="💰 Reparto Avanzado y Asistencia Registrada", color=discord.Color.green())
+        else:
+            embed = discord.Embed(
+                title="⏳ Reparto Parcial Completado",
+                description="La actividad **SIGUE ABIERTA**. Puedes modificar la plantilla y hacer otro split.",
+                color=discord.Color.orange()
+            )
         resumen = (
             f"**Bolsas iniciales:** {self.formatear(v_bolsas)}\n"
             f"**Loot neto recaudado:** {self.formatear(loot_inicial)}\n"
@@ -288,10 +316,41 @@ class Silver(commands.Cog):
         )
         embed.add_field(name="Resumen de Operación", value=resumen, inline=False)
         embed.add_field(name="👥 Distribución Detallada", value=lista_pagos, inline=False)
-        embed.set_footer(text="Contenido completado. Hilo archivado.")
+        embed.set_footer(text="Contenido completado. Hilo archivado." if cerrar
+                         else "Usa /desanotar para liberar puestos antes del próximo split.")
+        return True, embed
 
-        await ctx.send(embed=embed)
-        await ctx.channel.edit(locked=True, archived=True)
+    async def _solicitar_aprobacion_split(self, ctx, params, cerrar):
+        rol_oficial = discord.utils.get(ctx.guild.roles, name="Oficial")
+        mencion = rol_oficial.mention if rol_oficial else "**Oficiales**"
+        tipo_txt = "Split (cierra la actividad)" if cerrar else "Split parcial (no cierra)"
+
+        resumen = (
+            f"📦 **Bolsas:** {params['bolsas']}\n"
+            f"💎 **Loot:** {params['loot']}\n"
+            f"🗺️ **Costo mapa:** {params['costo_mapa']}\n"
+            f"🏦 **Tax:** {params['tax_porcentaje']}%\n"
+            f"⚡ **Venta rápida:** {params['venta_rapida']}%"
+        )
+        if params['excluir']:
+            resumen += f"\n🚫 **Excluye a:** {params['excluir'].mention}"
+
+        embed = discord.Embed(
+            title="⏳ Split pendiente de aprobación",
+            description=(
+                f"{ctx.author.mention} (Creador de Contenido) solicita un **{tipo_txt}**.\n\n"
+                f"{resumen}\n\n"
+                "Un **Oficial** o **Guild Master** debe aprobarlo. El silver **no se reparte** hasta entonces."
+            ),
+            color=discord.Color.orange()
+        )
+        view = AprobacionSplitView(self, solicitante=ctx.author, channel=ctx.channel,
+                                   guild=ctx.guild, params=params, cerrar=cerrar)
+        msg = await ctx.send(
+            content=f"🔔 {mencion} — revisión de split solicitada por **{ctx.author.display_name}**",
+            embed=embed, view=view
+        )
+        view.msg = msg
 
     @commands.hybrid_command(name="progremio", description="Registra asistencia de la actividad sin repartir silver y cierra el hilo")
     @app_commands.describe(excluir="Miembro a excluir del registro")
@@ -366,97 +425,23 @@ class Silver(commands.Cog):
         venta_rapida="% de descuento aplicado al loot por venta rápida",
         excluir="Miembro a excluir del reparto"
     )
-    @commands.has_any_role("Oficial", "Guild Master")
+    @commands.has_any_role("Oficial", "Guild Master", "Creador de Contenido")
     async def split_medio(self, ctx, bolsas: str, loot: str, costo_mapa: str = "0", tax_porcentaje: int = 15, venta_rapida: int = 0, excluir: discord.Member = None):
         if not isinstance(ctx.channel, discord.Thread):
             return await ctx.send("❌ Usa esto en un hilo activo.", delete_after=5)
         await ctx.defer()
 
-        hilo_id = str(ctx.channel.id)
-        result = await asyncio.to_thread(
-            lambda: get_db().table('registros_activos').select('*').eq('hilo_id', hilo_id).execute()
-        )
-        if not result.data:
-            return await ctx.send("❌ No hay una actividad activa registrada en este hilo.")
+        params = dict(bolsas=bolsas, loot=loot, costo_mapa=costo_mapa,
+                      tax_porcentaje=tax_porcentaje, venta_rapida=venta_rapida, excluir=excluir)
 
-        registro = result.data[0]
-        ids_validos = [uid for uid in registro['participantes'].values() if uid is not None]
+        # Creador de Contenido (sin rango de Staff): el split debe aprobarlo un Oficial
+        if not self._es_staff(ctx.author):
+            return await self._solicitar_aprobacion_split(ctx, params, cerrar=False)
 
-        participantes = []
-        for uid in ids_validos:
-            if excluir and str(excluir.id) == uid:
-                continue
-            m = ctx.guild.get_member(int(uid))
-            if m and not m.bot:
-                participantes.append(m)
-
-        if not participantes:
-            return await ctx.send("❌ No hay miembros anotados para efectuar el reparto parcial.")
-
-        v_bolsas = self.convertir_unidad(bolsas)
-        v_loot = self.convertir_unidad(loot)
-        v_costo_mapa = self.convertir_unidad(costo_mapa)
-
-        loot_inicial = int(v_loot * (1 - venta_rapida / 100))
-        mapa_pendiente = v_costo_mapa
-
-        cobrado_bolsas = min(v_bolsas, mapa_pendiente)
-        bolsas_restantes = v_bolsas - cobrado_bolsas
-        mapa_pendiente -= cobrado_bolsas
-
-        cobrado_loot = min(loot_inicial, mapa_pendiente)
-        loot_restante = loot_inicial - cobrado_loot
-
-        tax = int(loot_restante * (tax_porcentaje / 100))
-        loot_final = loot_restante - tax
-
-        total_neto = max(0, bolsas_restantes + loot_final)
-        por_persona = total_neto // len(participantes)
-
-        lista_pagos = ""
-        for p in participantes:
-            await _actualizar_balance(p, por_persona, "split_medio", f"Split Parcial: {ctx.channel.name}")
-            lista_pagos += f"{p.mention}: **{self.formatear(por_persona)}**\n"
-
-        # Registrar asistencias
-        asistencias_data = [{
-            'registro_actividad_id': registro['registro_actividad_id'],
-            'usuario_id': str(p.id),
-            'usuario_nombre': p.display_name
-        } for p in participantes]
-        await asyncio.to_thread(
-            lambda: get_db().table('asistencias').insert(asistencias_data).execute()
-        )
-
-        # Guardar snapshot para poder revertir este split parcial (/deshacer_split)
-        pagos_split = {str(p.id): por_persona for p in participantes}
-        await asyncio.to_thread(
-            lambda: get_db().table('splits_historial').insert({
-                'hilo_id': hilo_id,
-                'registro_actividad_id': registro['registro_actividad_id'],
-                'tipo_split': 'split_medio',
-                'pagos': pagos_split,
-                'cerro_actividad': False,
-                'registro_snapshot': registro
-            }).execute()
-        )
-
-        embed = discord.Embed(
-            title="⏳ Reparto Parcial Completado",
-            description="La actividad **SIGUE ABIERTA**. Puedes modificar la plantilla y hacer otro split.",
-            color=discord.Color.orange()
-        )
-        resumen = (
-            f"**Bolsas iniciales:** {self.formatear(v_bolsas)}\n"
-            f"**Loot neto recaudado:** {self.formatear(loot_inicial)}\n"
-            f"**Costo de mapa:** -{self.formatear(v_costo_mapa)} *(cobrado de las bolsas primero)*\n"
-            f"**Tax gremio ({tax_porcentaje}% del loot):** -{self.formatear(tax)}\n"
-            f"**Total neto a repartir:** {self.formatear(total_neto)}"
-        )
-        embed.add_field(name="Resumen de Operación", value=resumen, inline=False)
-        embed.add_field(name="👥 Distribución Detallada", value=lista_pagos, inline=False)
-        embed.set_footer(text="Usa /desanotar para liberar puestos antes del próximo split.")
-        await ctx.send(embed=embed)
+        ok, payload = await self._realizar_split(ctx.channel, ctx.guild, cerrar=False, **params)
+        if not ok:
+            return await ctx.send(payload)
+        await ctx.send(embed=payload)
 
     @commands.hybrid_command(name="deshacer_split", description="Revierte el último split del hilo: devuelve el silver, borra asistencias y reabre la actividad")
     @commands.has_any_role("Oficial", "Guild Master")
@@ -727,11 +712,15 @@ class Silver(commands.Cog):
         embed.set_footer(text=f"Total pendiente: {self.formatear(total)} silver • Usa /quitar_multa <id> para cancelar una")
         await ctx.send(embed=embed)
 
-    @commands.hybrid_command(name="saldar_multa", description="Paga una multa específica descontándola del balance del miembro")
-    @app_commands.describe(usuario="El miembro")
-    @commands.has_any_role("Oficial", "Guild Master")
-    async def saldar_multa(self, ctx, usuario: discord.Member):
+    @commands.hybrid_command(name="saldar_multa", description="Paga una de tus multas con tu balance (Staff puede saldar la de otros)")
+    @app_commands.describe(usuario="El miembro (por defecto, tú mismo)")
+    async def saldar_multa(self, ctx, usuario: discord.Member = None):
         await ctx.defer(ephemeral=True)
+
+        if usuario is None:
+            usuario = ctx.author
+        elif usuario != ctx.author and not any(r.name in ["Oficial", "Guild Master"] for r in ctx.author.roles):
+            return await ctx.send("❌ Solo Oficiales y Guild Masters pueden saldar las multas de otros.", delete_after=5)
 
         balance_result, multas_result = await asyncio.gather(
             asyncio.to_thread(
@@ -753,11 +742,15 @@ class Silver(commands.Cog):
         view = SaldarMultaView(self, usuario, multas, saldo)
         await ctx.send(embed=self._embed_multas_saldo(usuario, multas, saldo), view=view)
 
-    @commands.hybrid_command(name="saldar_todas_multas", description="Usa el balance del miembro para pagar todas sus multas (hasta donde alcance)")
-    @app_commands.describe(usuario="El miembro")
-    @commands.has_any_role("Oficial", "Guild Master")
-    async def saldar_todas_multas(self, ctx, usuario: discord.Member):
+    @commands.hybrid_command(name="saldar_todas_multas", description="Usa tu balance para pagar todas tus multas (Staff puede las de otros)")
+    @app_commands.describe(usuario="El miembro (por defecto, tú mismo)")
+    async def saldar_todas_multas(self, ctx, usuario: discord.Member = None):
         await ctx.defer()
+
+        if usuario is None:
+            usuario = ctx.author
+        elif usuario != ctx.author and not any(r.name in ["Oficial", "Guild Master"] for r in ctx.author.roles):
+            return await ctx.send("❌ Solo Oficiales y Guild Masters pueden saldar las multas de otros.", delete_after=5)
 
         balance_result, multas_result = await asyncio.gather(
             asyncio.to_thread(
@@ -970,6 +963,74 @@ class SaldarMultaView(discord.ui.View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
+
+
+class AprobacionSplitView(discord.ui.View):
+    def __init__(self, cog, *, solicitante, channel, guild, params, cerrar):
+        super().__init__(timeout=3600)  # 1 hora para aprobar
+        self.cog = cog
+        self.solicitante = solicitante
+        self.channel = channel
+        self.guild = guild
+        self.params = params
+        self.cerrar = cerrar
+        self.msg = None
+        self.resuelto = False
+
+    def _es_oficial(self, member) -> bool:
+        return any(r.name in ("Oficial", "Guild Master") for r in member.roles)
+
+    @discord.ui.button(label="Aprobar", emoji="✅", style=discord.ButtonStyle.green)
+    async def aprobar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._es_oficial(interaction.user):
+            return await interaction.response.send_message("❌ Solo un Oficial o Guild Master puede aprobar.", ephemeral=True)
+        if self.resuelto:
+            return await interaction.response.send_message("⚠️ Esta solicitud ya fue resuelta.", ephemeral=True)
+        self.resuelto = True
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ Split aprobado por {interaction.user.mention} — solicitado por {self.solicitante.mention}.",
+            view=self
+        )
+
+        ok, payload = await self.cog._realizar_split(self.channel, self.guild, cerrar=self.cerrar, **self.params)
+        if not ok:
+            await self.channel.send(payload)
+            return
+        await self.channel.send(embed=payload)
+        if self.cerrar:
+            try:
+                await self.channel.edit(locked=True, archived=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Rechazar", emoji="🚫", style=discord.ButtonStyle.red)
+    async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._es_oficial(interaction.user):
+            return await interaction.response.send_message("❌ Solo un Oficial o Guild Master puede rechazar.", ephemeral=True)
+        if self.resuelto:
+            return await interaction.response.send_message("⚠️ Esta solicitud ya fue resuelta.", ephemeral=True)
+        self.resuelto = True
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"🚫 Split rechazado por {interaction.user.mention}. No se repartió nada.",
+            view=self
+        )
+
+    async def on_timeout(self):
+        if self.resuelto:
+            return
+        for child in self.children:
+            child.disabled = True
+        if self.msg:
+            try:
+                await self.msg.edit(content="⏱️ Solicitud de split expirada sin aprobación. No se repartió nada.", view=self)
+            except Exception:
+                pass
 
 
 async def setup(bot):
