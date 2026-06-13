@@ -140,7 +140,7 @@ Los splits reparten el silver de una actividad entre los anotados, registran su 
 
 El cálculo descuenta primero el costo del mapa (de las bolsas), aplica el descuento por venta rápida al loot y luego el tax del gremio. El resto se reparte en partes iguales.
 
-### `/split` 🔵 🧵
+### `/split` 🟡 🧵
 Reparte el silver, registra asistencia y **cierra y archiva** la actividad.
 - **bolsas**: silver en bolsas (ej: `20m`).
 - **loot**: estimado del loot (ej: `5m`).
@@ -149,8 +149,10 @@ Reparte el silver, registra asistencia y **cierra y archiva** la actividad.
 - **venta_rapida** *(opcional, def. 0)*: % de descuento aplicado al loot por venta rápida.
 - **excluir** *(opcional)*: miembro a excluir del reparto.
 
-### `/split_medio` 🔵 🧵
-Igual que `/split` pero **NO cierra** la actividad: reparte y registra asistencia, pero el hilo queda abierto para poder modificar la lista y volver a repartir. Mismos parámetros que `/split`.
+> **Aprobación:** si lo lanza un **Creador de Contenido** (sin rango de Oficial/GM), el reparto **no se ejecuta de inmediato**: se publica una solicitud etiquetando a **@Oficial** con botones *Aprobar/Rechazar*. El silver solo se reparte cuando un Oficial o GM **aprueba**. Si lo lanza un Oficial/GM, se ejecuta directo.
+
+### `/split_medio` 🟡 🧵
+Igual que `/split` pero **NO cierra** la actividad: reparte y registra asistencia, pero el hilo queda abierto para poder modificar la lista y volver a repartir. Mismos parámetros que `/split`. También requiere **aprobación de un Oficial** si lo lanza un Creador de Contenido.
 
 ### `/progremio` 🔵 🧵
 Registra la asistencia **sin repartir silver** y cierra el hilo. Marca la actividad como **doble asistencia**.
@@ -178,13 +180,13 @@ Aplica una multa pendiente a un miembro.
 Muestra las multas pendientes de un miembro (con su ID). Para ver las de otro hace falta ser 🔵 Staff.
 - **usuario** *(opcional)*.
 
-### `/saldar_multa` 🔵
-Paga **una** multa específica descontándola del balance del miembro. Muestra un menú desplegable para elegir cuál.
-- **usuario**: el miembro.
+### `/saldar_multa` 🟢
+Paga **una** de tus multas descontándola de tu balance (menú desplegable para elegir cuál). Cualquiera puede saldar las suyas; solo el 🔵 Staff puede saldar las de **otro** miembro.
+- **usuario** *(opcional)*: el miembro (por defecto, tú mismo).
 
-### `/saldar_todas_multas` 🔵
-Usa el balance del miembro para pagar **todas** sus multas (hasta donde alcance el saldo).
-- **usuario**: el miembro.
+### `/saldar_todas_multas` 🟢
+Usa tu balance para pagar **todas** tus multas (hasta donde alcance el saldo). Cualquiera para las suyas; solo el 🔵 Staff para las de otro.
+- **usuario** *(opcional)*: el miembro (por defecto, tú mismo).
 
 ### `/quitar_multa` 🔵
 Cancela una multa por su **ID** (visible en `/ver_multas`) sin descontar nada.
@@ -204,7 +206,7 @@ Muestra el historial de las últimas 15 actividades de un miembro. Para ver el d
 Elimina una asistencia específica de un miembro (con autocompletado de sus actividades).
 - **usuario**, **indice**.
 
-### `/top` 🟢
+### `/top` 🔵
 Ranking de los miembros con más puntos de asistencia en el periodo.
 - **periodo** *(opcional, def. `semana`)*: `semana`, `bisemanal` o `total`.
 
@@ -232,7 +234,7 @@ Resumen del periodo: actividades realizadas, participantes únicos, silver repar
 
 Mini-juegos de apuestas contra el **banco del gremio**. La apuesta máxima general es **600k**. El banco debe tener fondos suficientes para cubrir el doble de la apuesta.
 
-> **Rol "Donador Certificado":** quien pierde más de **3m** en un día recibe este rol y queda limitado a apostar como máximo **1m al día** hasta que expire.
+> **Rol "Donador Certificado":** quien pierde más de **5m** en un día recibe este rol y queda limitado a apostar como máximo **1.5m al día** hasta que expire.
 
 ### `/ruleta` 🟢
 🔫 Ruleta rusa **entre jugadores** (no contra la casa). Se paga un asiento y el bote va para el sobreviviente.
