@@ -8,12 +8,13 @@ from db import get_db, get_balance_lock
 from cogs.silver import _actualizar_balance
 
 BANCO_ID = "BANCO_GREMIO"
-MAX_APUESTA = 300_000
-LIMITE_PERDEDOR_DIA = 3_000_000
-LIMITE_APUESTA_PERDEDOR = 1_000_000
+MAX_APUESTA = 600_000
+LIMITE_PERDEDOR_DIA = 5_000_000
+LIMITE_APUESTA_PERDEDOR = 1_500_000
 NUM_MAZOS = 6
 ZAPATO_MINIMO = int(52 * 2.5)   # < 2.5 mazos → reshuffle
 RACHA_MAX_GANA = 3
+MULT_SEVEN = 2   # Under/Over pagan x1 (1:1); acertar el 7 exacto paga x2 (ganancia = doble de la apuesta)
 ROL_PERDEDOR = "Donador Certificado"
 CANAL_VERGUENZA = "🎲┃leyendas-de-la-perdida"
 
@@ -183,7 +184,7 @@ class Casino(commands.Cog):
             return
 
         try:
-            await member.add_roles(rol, reason="Perdió más de 3M en el casino")
+            await member.add_roles(rol, reason=f"Perdió más de {self.fmt(LIMITE_PERDEDOR_DIA)} en el casino")
             # Mover el rol al tope (justo debajo del rol más alto del bot)
             bot_top = guild.me.top_role.position
             await rol.edit(position=max(1, bot_top - 1))
@@ -211,7 +212,7 @@ class Casino(commands.Cog):
                     f"al casino en un solo día.\n\n"
                     f"Por tan **invaluable** contribución, se le otorga el codiciado título de:\n"
                     f"🎖️ **{ROL_PERDEDOR}** 🎖️\n\n"
-                    f"Su límite de apuesta queda reducido a **1.000.000 silver diario**.\n"
+                    f"Su límite de apuesta queda reducido a **{self.fmt(LIMITE_APUESTA_PERDEDOR)} silver diario**.\n"
                     f"El rol se quitará en **48 horas**. ¡Que todos lo conozcan! 😂"
                 ),
                 color=discord.Color.dark_gold()
@@ -537,7 +538,7 @@ class Casino(commands.Cog):
     # ── DADOS (vs casa) ───────────────────────────────────────────────────────
 
     @commands.hybrid_command(name="dados", description="🎲 Tira un dado contra la casa — el mayor gana")
-    @app_commands.describe(apuesta="Plata a apostar (máx 300k — Ej: 100k)")
+    @app_commands.describe(apuesta="Plata a apostar (máx 600k — Ej: 100k)")
     async def dados(self, ctx, apuesta: str):
         valor = self.cvt(apuesta)
         if not await self.validar_apuesta(ctx, valor):
@@ -604,10 +605,40 @@ class Casino(commands.Cog):
         finally:
             self.jugando.discard(uid)
 
+    # ── UNDER / OVER 7 (2 dados vs casa, con botones) ────────────────────────
+
+    @commands.hybrid_command(name="under_over", description="🎲 Apuesta a si la suma de 2 dados será baja (2-6), 7 exacto, o alta (8-12)")
+    @app_commands.describe(apuesta="Plata a apostar (máx 600k — Ej: 100k)")
+    async def under_over(self, ctx, apuesta: str):
+        valor = self.cvt(apuesta)
+        if not await self.validar_apuesta(ctx, valor):
+            return
+        uid = str(ctx.author.id)
+        if uid in self.jugando:
+            return await ctx.send("❌ Ya tienes un juego activo.", delete_after=5)
+
+        self.jugando.add(uid)
+        view = UnderOverView(self, valor, ctx)
+        embed = discord.Embed(
+            title="🎲 UNDER / OVER 7",
+            description=(
+                f"Apuesta: **{self.fmt(valor)}** silver\n\n"
+                "Se lanzan **2 dados**. ¿Cuál será la suma?\n"
+                "⬇️ **Bajo (2–6)** — paga **x1** (doblas)\n"
+                "7️⃣ **Siete exacto** — paga **x2**\n"
+                "⬆️ **Alto (8–12)** — paga **x1** (doblas)\n\n"
+                "*Si sale **7** y elegiste Bajo o Alto, pierdes.*\n"
+                "Pulsa un botón para apostar."
+            ),
+            color=discord.Color.blurple()
+        )
+        msg = await ctx.send(embed=embed, view=view)
+        view.msg = msg
+
     # ── BLACKJACK (vs casa, zapato compartido de 6 mazos) ────────────────────
 
     @commands.hybrid_command(name="blackjack", description="🃏 Blackjack contra la casa — llega a 21")
-    @app_commands.describe(apuesta="Plata a apostar (máx 300k — Ej: 200k)")
+    @app_commands.describe(apuesta="Plata a apostar (máx 600k — Ej: 200k)")
     async def blackjack(self, ctx, apuesta: str):
         valor = self.cvt(apuesta)
         if not await self.validar_apuesta(ctx, valor):
@@ -872,6 +903,109 @@ class RuletaView(discord.ui.View):
             return await interaction.response.send_message("❌ Solo el creador puede forzar el inicio.", ephemeral=True)
         self.stop()
         await interaction.response.defer()
+
+
+class UnderOverView(discord.ui.View):
+    ETIQUETAS = {"under": "BAJO (2–6)", "seven": "SIETE EXACTO", "over": "ALTO (8–12)"}
+
+    def __init__(self, cog, valor, ctx):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.valor = valor
+        self.ctx = ctx
+        self.msg = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message("❌ Esta no es tu mesa.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        self.cog.jugando.discard(str(self.ctx.author.id))
+        if self.msg:
+            try:
+                await self.msg.edit(
+                    content="⏱️ Mesa cerrada por inactividad. No se cobró nada.",
+                    embed=None, view=None
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Bajo (2-6)", emoji="⬇️", style=discord.ButtonStyle.green)
+    async def btn_under(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolver(interaction, "under")
+
+    @discord.ui.button(label="Siete", emoji="7️⃣", style=discord.ButtonStyle.blurple)
+    async def btn_seven(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolver(interaction, "seven")
+
+    @discord.ui.button(label="Alto (8-12)", emoji="⬆️", style=discord.ButtonStyle.green)
+    async def btn_over(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolver(interaction, "over")
+
+    async def _resolver(self, interaction: discord.Interaction, eleccion: str):
+        self.stop()
+        uid = str(self.ctx.author.id)
+        etiqueta = self.ETIQUETAS[eleccion]
+
+        for child in self.children:
+            child.disabled = True
+
+        # Cobrar la apuesta al confirmar la jugada
+        self.cog._registrar_apuesta(uid, self.valor)
+        await _actualizar_balance(self.ctx.author, -self.valor, "entrada_casino", "Entrada Under/Over")
+        await self.cog.mover_banco(self.valor, "ingreso_casino", "Entrada Under/Over")
+
+        rodando = discord.Embed(
+            title="🎲 UNDER / OVER 7",
+            description=f"Apostaste **{self.cog.fmt(self.valor)}** al **{etiqueta}**\n```\n  🎲 🎲  Los dados ruedan...\n```",
+            color=discord.Color.blurple()
+        )
+        await interaction.response.edit_message(embed=rodando, view=self)
+
+        for _ in range(3):
+            await asyncio.sleep(0.8)
+            d1, d2 = random.randint(1, 6), random.randint(1, 6)
+            await interaction.message.edit(embed=discord.Embed(
+                title="🎲 UNDER / OVER 7",
+                description=f"Apostaste **{self.cog.fmt(self.valor)}** al **{etiqueta}**\n```\n   {DADO_EMO[d1]}   {DADO_EMO[d2]}\n```",
+                color=discord.Color.blurple()
+            ))
+
+        await asyncio.sleep(0.8)
+        d1, d2 = random.randint(1, 6), random.randint(1, 6)
+        suma = d1 + d2
+
+        gano = (
+            (eleccion == "under" and suma <= 6) or
+            (eleccion == "over" and suma >= 8) or
+            (eleccion == "seven" and suma == 7)
+        )
+
+        if gano:
+            premio = self.valor * MULT_SEVEN if eleccion == "seven" else self.valor
+            await _actualizar_balance(self.ctx.author, self.valor + premio, "premio_casino", f"Under/Over — ganancia +{self.cog.fmt(premio)}")
+            await self.cog.mover_banco(-(self.valor + premio), "pago_casino", f"Under/Over — pago a {self.ctx.author.display_name}")
+            titulo = "🎲 ¡GANASTE!"
+            color = discord.Color.gold() if eleccion == "seven" else discord.Color.green()
+            resultado = f"✅ **+{self.cog.fmt(premio)} silver**"
+            await self.cog._check_perdedor(self.ctx, uid, +premio)
+        else:
+            titulo = "🎲 PERDISTE"
+            color = discord.Color.red()
+            resultado = f"❌ **-{self.cog.fmt(self.valor)} silver**"
+            await self.cog._check_perdedor(self.ctx, uid, -self.valor)
+
+        saldo_actual = await self.cog.get_user_balance(uid)
+        desc = (
+            f"```\n   {DADO_EMO[d1]}   {DADO_EMO[d2]}     Suma = {suma}\n```\n"
+            f"Tu apuesta: **{etiqueta}**\n"
+            f"{resultado}\n"
+            f"💰 Balance: **{self.cog.fmt(saldo_actual)} silver**"
+        )
+        await interaction.message.edit(embed=discord.Embed(title=titulo, description=desc, color=color), view=None)
+        self.cog.jugando.discard(uid)
 
 
 class BlackjackView(discord.ui.View):

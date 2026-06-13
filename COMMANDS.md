@@ -230,7 +230,7 @@ Resumen del periodo: actividades realizadas, participantes únicos, silver repar
 
 ## 🎰 Casino
 
-Mini-juegos de apuestas contra el **banco del gremio**. La apuesta máxima general es **300k**. El banco debe tener fondos suficientes para cubrir el doble de la apuesta.
+Mini-juegos de apuestas contra el **banco del gremio**. La apuesta máxima general es **600k**. El banco debe tener fondos suficientes para cubrir el doble de la apuesta.
 
 > **Rol "Donador Certificado":** quien pierde más de **3m** en un día recibe este rol y queda limitado a apostar como máximo **1m al día** hasta que expire.
 
@@ -240,11 +240,19 @@ Mini-juegos de apuestas contra el **banco del gremio**. La apuesta máxima gener
 
 ### `/dados` 🟢
 🎲 Tiras un dado contra la casa; el número más alto gana.
-- **apuesta**: plata a apostar (máx 300k).
+- **apuesta**: plata a apostar (máx 600k).
 
 ### `/blackjack` 🃏
 Blackjack contra la casa, intentando llegar a 21. Incluye botones de pedir/plantarse/doblar.
-- **apuesta**: plata a apostar (máx 300k).
+- **apuesta**: plata a apostar (máx 600k).
+
+### `/under_over` 🟢
+🎲 Se lanzan **2 dados** y apuestas (con botones) a cómo será la suma:
+- ⬇️ **Bajo (2–6)** → paga **x1** (doblas la apuesta).
+- 7️⃣ **Siete exacto** → paga **x2**.
+- ⬆️ **Alto (8–12)** → paga **x1** (doblas la apuesta).
+- Si sale **7** y elegiste Bajo o Alto, **pierdes**.
+- **apuesta**: plata a apostar (máx 600k). No se cobra nada hasta que pulsas un botón.
 
 ### `/banco_balance` 🔵
 Muestra el balance del banco del gremio.
