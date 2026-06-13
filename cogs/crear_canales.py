@@ -123,6 +123,7 @@ class CrearCanales(commands.Cog):
             if rol:
                 await canal.set_permissions(
                     rol,
+                    view_channel=True,
                     manage_channels=True,
                     manage_permissions=True,
                     mute_members=True,

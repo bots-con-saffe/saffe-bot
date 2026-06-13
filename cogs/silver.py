@@ -6,20 +6,19 @@ import random
 from db import get_db, get_balance_lock
 
 
-async def _actualizar_balance(member: discord.Member, cantidad: int, tipo: str, motivo: str):
-    user_id = str(member.id)
-    nombre  = member.display_name
-
+async def _ajustar_balance_id(user_id: str, nombre: str, cantidad: int, tipo: str, motivo: str):
+    """Ajusta el balance por ID de usuario. Funciona aunque el miembro ya no esté en el servidor."""
     async with get_balance_lock(user_id):
         result = await asyncio.to_thread(
-            lambda: get_db().table('balances').select('balance').eq('usuario_id', user_id).execute()
+            lambda: get_db().table('balances').select('balance, usuario_nombre').eq('usuario_id', user_id).execute()
         )
         balance_actual = result.data[0]['balance'] if result.data else 0
+        nombre_final   = nombre or (result.data[0]['usuario_nombre'] if result.data else 'Desconocido')
         nuevo_balance  = balance_actual + cantidad
 
         await asyncio.to_thread(
             lambda: get_db().table('balances')
-                .upsert({'usuario_id': user_id, 'usuario_nombre': nombre, 'balance': nuevo_balance}, on_conflict='usuario_id')
+                .upsert({'usuario_id': user_id, 'usuario_nombre': nombre_final, 'balance': nuevo_balance}, on_conflict='usuario_id')
                 .execute()
         )
         await asyncio.to_thread(
@@ -27,6 +26,10 @@ async def _actualizar_balance(member: discord.Member, cantidad: int, tipo: str, 
                 .insert({'usuario_id': user_id, 'tipo': tipo, 'cantidad': cantidad, 'motivo': motivo})
                 .execute()
         )
+
+
+async def _actualizar_balance(member: discord.Member, cantidad: int, tipo: str, motivo: str):
+    await _ajustar_balance_id(str(member.id), member.display_name, cantidad, tipo, motivo)
 
 
 class Silver(commands.Cog):
@@ -253,6 +256,19 @@ class Silver(commands.Cog):
             lambda: get_db().table('asistencias').insert(asistencias_data).execute()
         )
 
+        # Guardar snapshot para poder revertir el split (/deshacer_split)
+        pagos_split = {str(p.id): por_persona for p in participantes}
+        await asyncio.to_thread(
+            lambda: get_db().table('splits_historial').insert({
+                'hilo_id': hilo_id,
+                'registro_actividad_id': registro['registro_actividad_id'],
+                'tipo_split': 'split',
+                'pagos': pagos_split,
+                'cerro_actividad': True,
+                'registro_snapshot': registro
+            }).execute()
+        )
+
         # Cerrar actividad
         pings_cog = self.bot.get_cog("PingsAlbion")
         if pings_cog:
@@ -412,6 +428,19 @@ class Silver(commands.Cog):
             lambda: get_db().table('asistencias').insert(asistencias_data).execute()
         )
 
+        # Guardar snapshot para poder revertir este split parcial (/deshacer_split)
+        pagos_split = {str(p.id): por_persona for p in participantes}
+        await asyncio.to_thread(
+            lambda: get_db().table('splits_historial').insert({
+                'hilo_id': hilo_id,
+                'registro_actividad_id': registro['registro_actividad_id'],
+                'tipo_split': 'split_medio',
+                'pagos': pagos_split,
+                'cerro_actividad': False,
+                'registro_snapshot': registro
+            }).execute()
+        )
+
         embed = discord.Embed(
             title="⏳ Reparto Parcial Completado",
             description="La actividad **SIGUE ABIERTA**. Puedes modificar la plantilla y hacer otro split.",
@@ -427,6 +456,100 @@ class Silver(commands.Cog):
         embed.add_field(name="Resumen de Operación", value=resumen, inline=False)
         embed.add_field(name="👥 Distribución Detallada", value=lista_pagos, inline=False)
         embed.set_footer(text="Usa /desanotar para liberar puestos antes del próximo split.")
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="deshacer_split", description="Revierte el último split del hilo: devuelve el silver, borra asistencias y reabre la actividad")
+    @commands.has_any_role("Oficial", "Guild Master")
+    async def deshacer_split(self, ctx):
+        if not isinstance(ctx.channel, discord.Thread):
+            return await ctx.send("❌ Usa esto dentro del hilo de la actividad.", delete_after=5)
+        await ctx.defer()
+
+        hilo_id = str(ctx.channel.id)
+        result = await asyncio.to_thread(
+            lambda: get_db().table('splits_historial').select('*')
+                .eq('hilo_id', hilo_id).order('id', desc=True).limit(1).execute()
+        )
+        if not result.data:
+            return await ctx.send("❌ No hay ningún split registrado en este hilo para revertir.")
+
+        hist = result.data[0]
+        pagos = hist.get('pagos') or {}
+        registro_actividad_id = hist.get('registro_actividad_id')
+
+        # 1. Devolver el silver repartido (funciona aunque el miembro haya salido)
+        devuelto_total = 0
+        for user_id, cantidad in pagos.items():
+            cantidad = int(cantidad)
+            if cantidad == 0:
+                continue
+            miembro = ctx.guild.get_member(int(user_id))
+            nombre = miembro.display_name if miembro else None
+            await _ajustar_balance_id(user_id, nombre, -cantidad, "deshacer_split", f"Reversa de split: {ctx.channel.name}")
+            devuelto_total += cantidad
+
+        # 2. Borrar las asistencias generadas por ese split
+        if registro_actividad_id and pagos:
+            await asyncio.to_thread(
+                lambda: get_db().table('asistencias').delete()
+                    .eq('registro_actividad_id', registro_actividad_id)
+                    .in_('usuario_id', list(pagos.keys()))
+                    .execute()
+            )
+
+        # 3. Reabrir la actividad si el split la había cerrado
+        reabierta = False
+        if hist.get('cerro_actividad'):
+            snap = hist.get('registro_snapshot') or {}
+            existe = await asyncio.to_thread(
+                lambda: get_db().table('registros_activos').select('hilo_id').eq('hilo_id', hilo_id).execute()
+            )
+            if not existe.data and snap:
+                nuevo_registro = {
+                    'hilo_id': hilo_id,
+                    'registro_actividad_id': snap.get('registro_actividad_id'),
+                    'guild_id': snap.get('guild_id'),
+                    'tipo': snap.get('tipo'),
+                    'nombre_contenido': snap.get('nombre_contenido'),
+                    'fecha_actividad': snap.get('fecha_actividad'),
+                    'lugar': snap.get('lugar'),
+                    'link_build': snap.get('link_build'),
+                    'multiplicador': snap.get('multiplicador'),
+                    'msg_id': snap.get('msg_id'),
+                    'puestos_nombres': snap.get('puestos_nombres'),
+                    'participantes': snap.get('participantes'),
+                }
+                await asyncio.to_thread(
+                    lambda: get_db().table('registros_activos').insert(nuevo_registro).execute()
+                )
+                try:
+                    await ctx.channel.edit(archived=False, locked=False)
+                except Exception as e:
+                    print(f"⚠️ No se pudo reabrir el hilo en deshacer_split: {e}")
+                pings_cog = self.bot.get_cog("PingsAlbion")
+                if pings_cog:
+                    await pings_cog.actualizar_mensaje(ctx.channel, nuevo_registro, estado="abierta")
+                reabierta = True
+
+        # 4. Eliminar el registro de historial ya revertido
+        await asyncio.to_thread(
+            lambda: get_db().table('splits_historial').delete().eq('id', hist['id']).execute()
+        )
+
+        embed = discord.Embed(title="↩️ Split revertido", color=discord.Color.gold())
+        embed.add_field(
+            name="💸 Silver devuelto",
+            value=f"**{self.formatear(devuelto_total)}** retirado de **{len(pagos)}** jugador(es)",
+            inline=False
+        )
+        if reabierta:
+            embed.add_field(
+                name="🔓 Actividad reabierta",
+                value="La inscripción volvió a abrirse. Ajusta la lista y vuelve a hacer el split.",
+                inline=False
+            )
+        else:
+            embed.set_footer(text="La actividad seguía abierta (split parcial). Vuelve a repartir cuando quieras.")
         await ctx.send(embed=embed)
 
     # --- GESTIÓN DE BALANCES ---

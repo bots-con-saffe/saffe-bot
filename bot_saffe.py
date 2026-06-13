@@ -94,11 +94,13 @@ async def restart(ctx):
 async def limpiar_comandos(ctx):
     """Limpia los comandos globales duplicados y deja solo los del servidor."""
     mensaje = await ctx.send("🧹 Iniciando limpieza de comandos fantasma...")
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
+    # Purga SOLO el scope global en Discord, sin vaciar el árbol de comandos en memoria.
+    # (clear_commands(guild=None) borraba los comandos del árbol y dejaba el servidor en 0)
+    await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+    # Re-registra los comandos únicamente a nivel de servidor (actualización instantánea)
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
-    await mensaje.edit(content=f"✅ Limpieza completada. Discord global ha sido purgado y se han registrado **{len(synced)}** comandos limpios exclusivamente para este servidor.")
+    await mensaje.edit(content=f"✅ Limpieza completada. El scope global de Discord fue purgado y se registraron **{len(synced)}** comandos exclusivamente para este servidor.")
 
 @bot.event
 async def on_ready():

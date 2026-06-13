@@ -396,9 +396,12 @@ class PingsAlbion(commands.Cog):
             await ctx.send(f"❌ El número **{numero}** no es válido para esta composición.", delete_after=5)
 
     @commands.hybrid_command(name="agregar_cupos", description="Añade ranuras extras de participantes a la actividad en curso")
-    @app_commands.describe(cantidad="Cuántos cupos extras quieres abrir (ej: 5)")
+    @app_commands.describe(
+        cantidad="Cuántos cupos extras quieres abrir (ej: 5)",
+        nombre="Nombre para los cupos nuevos (opcional; por defecto usa la plantilla)"
+    )
     @commands.has_any_role("Oficial", "Guild Master")
-    async def agregar_cupos(self, ctx, cantidad: int):
+    async def agregar_cupos(self, ctx, cantidad: int, *, nombre: str = None):
         if not isinstance(ctx.channel, discord.Thread):
             return await ctx.send("❌ Usa esto dentro del hilo de la actividad.", delete_after=5)
         if cantidad <= 0:
@@ -418,11 +421,13 @@ class PingsAlbion(commands.Cog):
         numeros_existentes = [int(k) for k in participantes.keys() if k.isdigit()]
         ultimo_numero = max(numeros_existentes) if numeros_existentes else 0
 
+        nombre_cupo = nombre.strip().upper() if nombre and nombre.strip() else act['tipo'].upper()
+
         nuevos_puestos = []
         for i in range(1, cantidad + 1):
             nuevo_indice = str(ultimo_numero + i)
             participantes[nuevo_indice] = None
-            puestos_nombres.append(act['tipo'].upper())
+            puestos_nombres.append(nombre_cupo)
             nuevos_puestos.append(nuevo_indice)
 
         await asyncio.to_thread(
@@ -438,7 +443,7 @@ class PingsAlbion(commands.Cog):
             description=f"Se expandió la composición en **{cantidad} slots nuevos**.",
             color=discord.Color.orange()
         )
-        lista_texto = "\n".join(f"**({num}) {act['tipo'].upper()}** — Vacante" for num in nuevos_puestos)
+        lista_texto = "\n".join(f"**({num}) {nombre_cupo}** — Vacante" for num in nuevos_puestos)
         embed_agregados.add_field(
             name=f"📋 Slots habilitados (del {nuevos_puestos[0]} al {nuevos_puestos[-1]})",
             value=lista_texto,
